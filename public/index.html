@@ -1,0 +1,2146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Freedom Boat Club — Reservation Confirmations</title>
+  <style>body { margin: 0; background: #F0F4F8; } #root { min-height: 100vh; }</style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect, useReducer, useCallback, useRef } = React;
+
+
+const FONT_URL = "https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700;800&family=Open+Sans:wght@400;500;600;700&display=swap";
+
+// ─── API Configuration ──────────────────────────────────────────
+// Set this to your backend URL when running with the Twilio server.
+// Leave empty string to use local simulation mode (no real SMS sent).
+const API_BASE = window.location.origin; // Same server
+
+const DOCKS = [
+  { id: "jax-beach", name: "Jacksonville Beach" },
+  { id: "julington-east", name: "Julington Creek East" },
+  { id: "julington-west", name: "Julington Creek West" },
+  { id: "camachee-cove", name: "St. Augustine — Camachee Cove" },
+  { id: "shipyard", name: "St. Augustine — Shipyard" },
+];
+
+const api = {
+  isLive: () => API_BASE.length > 0,
+
+  async sendSms(reservationId, customBody, dockId) {
+    const res = await fetch(`${API_BASE}/api/sms/send/${reservationId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...(customBody ? { customBody } : {}), dock: dockId }),
+    });
+    return res.json();
+  },
+
+  async sendBulk(ids, dockId) {
+    const res = await fetch(`${API_BASE}/api/sms/send-bulk`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, dock: dockId }),
+    });
+    return res.json();
+  },
+
+  async importReservations(data, dockId) {
+    const res = await fetch(`${API_BASE}/api/reservations/import?dock=${dockId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data, dock: dockId }),
+    });
+    return res.json();
+  },
+
+  async fetchReservations(dockId) {
+    const res = await fetch(`${API_BASE}/api/reservations?dock=${dockId}`);
+    return res.json();
+  },
+
+  async updateStatus(id, status, dockId) {
+    const res = await fetch(`${API_BASE}/api/reservations/${id}/status?dock=${dockId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status, dock: dockId }),
+    });
+    return res.json();
+  },
+
+  async getSmsLog(id, dockId) {
+    const res = await fetch(`${API_BASE}/api/sms/log/${id}?dock=${dockId}`);
+    return res.json();
+  },
+
+  async healthCheck() {
+    const res = await fetch(`${API_BASE}/api/health`);
+    return res.json();
+  },
+};
+
+// ─── Excel Parsing ──────────────────────────────────────────────
+const EXPECTED_FIELDS = [
+  { key: "name", label: "Guest Name", required: true, aliases: ["name", "guest", "guest name", "full name", "customer", "member", "member name"] },
+  { key: "email", label: "Email", required: false, aliases: ["email", "e-mail", "email address", "guest email"] },
+  { key: "phone", label: "Phone", required: false, aliases: ["phone", "phone number", "tel", "telephone", "mobile", "cell"] },
+  { key: "service", label: "Service / Type", required: false, aliases: ["service", "type", "reservation type", "event", "event type", "booking type"] },
+  { key: "date", label: "Date", required: true, aliases: ["date", "reservation date", "booking date", "event date", "day"] },
+  { key: "time", label: "Time", required: false, aliases: ["time", "reservation time", "booking time", "start time", "arrival"] },
+  { key: "guests", label: "Guests", required: false, aliases: ["guests", "party size", "party", "covers", "pax", "number of guests", "# guests", "size"] },
+  { key: "notes", label: "Notes", required: false, aliases: ["notes", "note", "comments", "comment", "special requests", "requests", "dietary"] },
+  { key: "channel", label: "Contact Method", required: false, aliases: ["channel", "contact method", "contact", "notification", "preferred contact"] },
+];
+
+function autoMapColumns(headers) {
+  const mapping = {};
+  const lowerHeaders = headers.map((h) => String(h || "").toLowerCase().trim());
+  EXPECTED_FIELDS.forEach((field) => {
+    const matchIdx = lowerHeaders.findIndex((h) => field.aliases.some((a) => h === a || h.includes(a)));
+    if (matchIdx !== -1) mapping[field.key] = headers[matchIdx];
+  });
+  return mapping;
+}
+
+function parseExcelDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value;
+  if (typeof value === "number") {
+    // Excel serial date
+    const epoch = new Date(1899, 11, 30);
+    return new Date(epoch.getTime() + value * 86400000);
+  }
+  const parsed = new Date(value);
+  return isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function parseTime(value, baseDate) {
+  if (!value) return baseDate;
+  const date = baseDate ? new Date(baseDate) : new Date();
+  if (typeof value === "number") {
+    // Excel fractional day
+    const totalMinutes = Math.round(value * 24 * 60);
+    date.setHours(Math.floor(totalMinutes / 60), totalMinutes % 60, 0, 0);
+    return date;
+  }
+  const str = String(value).trim();
+  const match = str.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+  if (match) {
+    let h = parseInt(match[1]);
+    const m = parseInt(match[2]);
+    const ampm = match[3];
+    if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
+    if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
+    date.setHours(h, m, 0, 0);
+  }
+  return date;
+}
+
+function rowsToReservations(rows, mapping) {
+  return rows.map((row, i) => {
+    const get = (key) => row[mapping[key]] ?? "";
+    const baseDate = parseExcelDate(get("date"));
+    const dateWithTime = parseTime(get("time"), baseDate);
+    const channelRaw = String(get("channel")).toLowerCase().trim();
+    const channel = ["sms", "email", "both"].includes(channelRaw) ? channelRaw : "both";
+
+    return {
+      id: `RES-${String(i + 1).padStart(3, "0")}`,
+      name: String(get("name")).trim() || `Guest ${i + 1}`,
+      email: String(get("email")).trim(),
+      phone: String(get("phone")).trim(),
+      service: String(get("service")).trim() || "Reservation",
+      date: dateWithTime || new Date(),
+      guests: parseInt(get("guests")) || 1,
+      status: "unconfirmed",
+      channel,
+      messageSent: false,
+      messageTime: null,
+      notes: String(get("notes")).trim(),
+    };
+  }).filter((r) => r.name && r.date);
+}
+
+// ─── Reducer ─────────────────────────────────────────────────────
+function reducer(state, action) {
+  switch (action.type) {
+    case "SET_DOCK":
+      return { ...state, currentDock: action.payload, view: "reservations", reservations: [], selected: new Set(), selectedId: null };
+    case "SWITCH_DOCK":
+      return { ...state, currentDock: null, view: "dock-select", reservations: [], selected: new Set(), selectedId: null, smsDrawer: null, smsCompose: null };
+    case "SET_FILTER":
+      return { ...state, filter: action.payload };
+    case "SET_SEARCH":
+      return { ...state, search: action.payload };
+    case "SEND_REMINDER": {
+      const updated = state.reservations.map((r) => {
+        if (r.id !== action.payload) return r;
+        const dateStr = r.date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+        const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+        const outbound = {
+          from: "system",
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          time: new Date(),
+        };
+        return { ...r, messageSent: true, messageTime: new Date(), status: r.status === "unconfirmed" ? "pending" : r.status, smsLog: [outbound] };
+      });
+      return { ...state, reservations: updated };
+    }
+    case "SEND_ALL_REMINDERS": {
+      const updated = state.reservations.map((r) => {
+        if (r.messageSent) return r;
+        const dateStr = r.date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+        const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+        const outbound = {
+          from: "system",
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          time: new Date(),
+        };
+        return { ...r, messageSent: true, messageTime: new Date(), status: "pending", smsLog: [outbound] };
+      });
+      return { ...state, reservations: updated, showToast: "All SMS confirmations sent!" };
+    }
+    case "UPDATE_STATUS": {
+      const updated = state.reservations.map((r) =>
+        r.id === action.payload.id ? { ...r, status: action.payload.status } : r
+      );
+      return { ...state, reservations: updated };
+    }
+    case "TOGGLE_DETAIL":
+      return { ...state, selectedId: state.selectedId === action.payload ? null : action.payload };
+    case "SET_VIEW":
+      return { ...state, view: action.payload };
+    case "DISMISS_TOAST":
+      return { ...state, showToast: null };
+    case "LOAD_DATA":
+      return { ...state, reservations: action.payload, selected: new Set(), showToast: `${action.payload.length} reservations imported!` };
+    case "LOAD_DATA_SILENT":
+      return { ...state, reservations: action.payload };
+    case "SHOW_TOAST":
+      return { ...state, showToast: action.payload };
+    case "CLEAR_DATA":
+      return { ...state, reservations: [], selected: new Set(), selectedId: null };
+    case "OPEN_SMS":
+      return { ...state, smsDrawer: action.payload };
+    case "CLOSE_SMS":
+      return { ...state, smsDrawer: null };
+    case "OPEN_COMPOSE":
+      return { ...state, smsCompose: action.payload };
+    case "CLOSE_COMPOSE":
+      return { ...state, smsCompose: null };
+    case "SIMULATE_REPLY": {
+      const { id, reply } = action.payload;
+      const updated = state.reservations.map((r) => {
+        if (r.id !== id) return r;
+        const newLog = [...(r.smsLog || []), { from: "member", text: reply, time: new Date() }];
+        const replyLower = reply.toLowerCase().trim();
+        // Parse CONFIRM
+        if (replyLower === "confirm" || replyLower === "yes" || replyLower === "c") {
+          newLog.push({ from: "system", text: "Thank you! Your reservation is confirmed. We look forward to seeing you!", time: new Date() });
+          return { ...r, smsLog: newLog, status: "confirmed" };
+        }
+        // Parse CANCEL
+        if (replyLower === "cancel" || replyLower === "no") {
+          newLog.push({ from: "system", text: "Your reservation has been cancelled. If you change your mind, please call us to rebook.", time: new Date() });
+          return { ...r, smsLog: newLog, status: "cancelled" };
+        }
+        // Parse TIME change — e.g. "TIME 7:30 PM" or "time 19:00"
+        const timeMatch = replyLower.match(/^time\s+(\d{1,2}):?(\d{2})?\s*(am|pm)?$/i);
+        if (timeMatch) {
+          let h = parseInt(timeMatch[1]);
+          const m = parseInt(timeMatch[2] || "0");
+          const ampm = timeMatch[3];
+          if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
+          if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
+          const newDate = new Date(r.date);
+          newDate.setHours(h, m, 0, 0);
+          const timeStr = newDate.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+          newLog.push({ from: "system", text: `Got it! Your arrival time has been updated to ${timeStr}. Please reply CONFIRM to finalize.`, time: new Date() });
+          return { ...r, smsLog: newLog, date: newDate, originalTime: r.originalTime || r.date, timeUpdated: true };
+        }
+        // Unrecognized
+        newLog.push({ from: "system", text: "Sorry, I didn't understand that. Please reply CONFIRM, CANCEL, or TIME followed by your new time (e.g. TIME 7:30 PM).", time: new Date() });
+        return { ...r, smsLog: newLog };
+      });
+      return { ...state, reservations: updated };
+    }
+    case "SEND_SMS": {
+      const { id } = action.payload;
+      const updated = state.reservations.map((r) => {
+        if (r.id !== id) return r;
+        const dateStr = r.date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+        const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+        const outbound = {
+          from: "system",
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          time: new Date(),
+        };
+        return { ...r, messageSent: true, messageTime: new Date(), status: r.status === "unconfirmed" ? "pending" : r.status, smsLog: [outbound] };
+      });
+      return { ...state, reservations: updated, showToast: "SMS confirmation sent!" };
+    }
+    // ─── Bulk Selection Actions ─────────────────────────────
+    case "TOGGLE_SELECT": {
+      const next = new Set(state.selected);
+      if (next.has(action.payload)) next.delete(action.payload);
+      else next.add(action.payload);
+      return { ...state, selected: next };
+    }
+    case "SELECT_ALL_FILTERED": {
+      const next = new Set(state.selected);
+      action.payload.forEach((id) => next.add(id));
+      return { ...state, selected: next };
+    }
+    case "DESELECT_ALL":
+      return { ...state, selected: new Set() };
+    case "BULK_CONFIRM": {
+      const updated = state.reservations.map((r) =>
+        state.selected.has(r.id) && r.status !== "cancelled"
+          ? { ...r, status: "confirmed" }
+          : r
+      );
+      const count = [...state.selected].filter(id => {
+        const r = state.reservations.find(res => res.id === id);
+        return r && r.status !== "cancelled";
+      }).length;
+      return { ...state, reservations: updated, selected: new Set(), showToast: `${count} reservation${count !== 1 ? "s" : ""} confirmed!` };
+    }
+    case "BULK_CANCEL": {
+      const updated = state.reservations.map((r) =>
+        state.selected.has(r.id) ? { ...r, status: "cancelled" } : r
+      );
+      const count = state.selected.size;
+      return { ...state, reservations: updated, selected: new Set(), showToast: `${count} reservation${count !== 1 ? "s" : ""} cancelled.` };
+    }
+    case "BULK_SEND": {
+      const updated = state.reservations.map((r) => {
+        if (!state.selected.has(r.id) || r.messageSent) return r;
+        const dateStr = r.date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+        const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+        const outbound = {
+          from: "system",
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          time: new Date(),
+        };
+        return { ...r, messageSent: true, messageTime: new Date(), status: r.status === "unconfirmed" ? "pending" : r.status, smsLog: [outbound] };
+      });
+      const count = [...state.selected].filter(id => {
+        const r = state.reservations.find(res => res.id === id);
+        return r && !r.messageSent;
+      }).length;
+      return { ...state, reservations: updated, selected: new Set(), showToast: `Reminders sent to ${count} guest${count !== 1 ? "s" : ""}!` };
+    }
+    default:
+      return state;
+  }
+}
+
+// ─── Styles — Freedom Boat Club Brand ────────────────────────────
+const palette = {
+  bg: "#F0F4F8",        // Light cool grey-blue
+  card: "#FFFFFF",
+  dark: "#0B2545",       // FBC navy
+  muted: "#6B7D94",      // Muted navy
+  accent: "#C41E3A",     // FBC red
+  accentLight: "#FCE8EC",
+  green: "#1B813E",      // Confirmation green
+  greenLight: "#E4F2E9",
+  amber: "#D4851C",      // Warning amber
+  amberLight: "#FDF3E0",
+  red: "#C41E3A",        // FBC red (same as accent)
+  redLight: "#FCE8EC",
+  blue: "#0B2545",       // FBC navy
+  blueLight: "#E1E8F0",
+  border: "#D1DAE6",
+  shadow: "0 1px 3px rgba(11,37,69,0.04), 0 4px 12px rgba(11,37,69,0.06)",
+  shadowHover: "0 2px 8px rgba(11,37,69,0.08), 0 8px 24px rgba(11,37,69,0.08)",
+};
+
+const statusConfig = {
+  confirmed: { color: palette.green, bg: palette.greenLight, label: "Confirmed", icon: "✓" },
+  pending: { color: palette.amber, bg: palette.amberLight, label: "Pending", icon: "◷" },
+  unconfirmed: { color: palette.blue, bg: palette.blueLight, label: "Awaiting", icon: "○" },
+  cancelled: { color: palette.red, bg: palette.redLight, label: "Cancelled", icon: "✕" },
+};
+
+// ─── Components ──────────────────────────────────────────────────
+function StatusBadge({ status }) {
+  const cfg = statusConfig[status];
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 5,
+      padding: "4px 12px", borderRadius: 20,
+      background: cfg.bg, color: cfg.color,
+      fontSize: 12, fontWeight: 600, letterSpacing: 0.3,
+      fontFamily: "'Open Sans', sans-serif",
+    }}>
+      <span style={{ fontSize: 11 }}>{cfg.icon}</span> {cfg.label}
+    </span>
+  );
+}
+
+function StatCard({ label, value, sub, color, icon }) {
+  return (
+    <div style={{
+      background: palette.card, borderRadius: 16, padding: "22px 24px",
+      boxShadow: palette.shadow, border: `1px solid ${palette.border}`,
+      flex: 1, minWidth: 160, transition: "box-shadow 0.2s",
+      position: "relative", overflow: "hidden",
+    }}>
+      <div style={{
+        position: "absolute", top: -8, right: -8, width: 56, height: 56,
+        borderRadius: "50%", background: color || palette.accentLight, opacity: 0.2,
+      }} />
+      <div style={{
+        fontSize: 11, color: palette.muted, fontWeight: 600, letterSpacing: 1,
+        textTransform: "uppercase", fontFamily: "'Open Sans', sans-serif",
+        marginBottom: 8,
+      }}>{label}</div>
+      <div style={{
+        fontSize: 32, fontWeight: 700, color: palette.dark,
+        fontFamily: "'Montserrat', sans-serif", lineHeight: 1,
+      }}>{value}</div>
+      {sub && (
+        <div style={{
+          fontSize: 12, color: palette.muted, marginTop: 6,
+          fontFamily: "'Open Sans', sans-serif",
+        }}>{sub}</div>
+      )}
+    </div>
+  );
+}
+
+function Toast({ message, onDismiss }) {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 3000);
+    return () => clearTimeout(t);
+  }, [onDismiss]);
+
+  return (
+    <div style={{
+      position: "fixed", bottom: 32, left: "50%", transform: "translateX(-50%)",
+      background: palette.green, color: "#fff", padding: "14px 28px",
+      borderRadius: 12, fontFamily: "'Open Sans', sans-serif", fontSize: 14,
+      fontWeight: 500, boxShadow: "0 8px 32px rgba(61,139,110,0.3)",
+      zIndex: 9999, animation: "slideUp 0.3s ease-out",
+      display: "flex", alignItems: "center", gap: 10,
+    }}>
+      <span style={{ fontSize: 18 }}>✓</span> {message}
+    </div>
+  );
+}
+
+function ReservationRow({ res, isSelected, isChecked, dispatch }) {
+  const dateStr = res.date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+  const timeStr = res.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+
+  return (
+    <div
+      onClick={() => dispatch({ type: "TOGGLE_DETAIL", payload: res.id })}
+      style={{
+        background: isChecked ? "#E8EDF4" : isSelected ? "#F5F8FB" : palette.card,
+        borderRadius: 14, padding: "16px 20px",
+        marginBottom: 8, cursor: "pointer",
+        border: `1px solid ${isChecked ? palette.accent + "50" : isSelected ? palette.accent + "40" : palette.border}`,
+        boxShadow: isSelected ? palette.shadowHover : "none",
+        transition: "all 0.2s ease",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+        {/* Checkbox */}
+        <div
+          onClick={(e) => { e.stopPropagation(); dispatch({ type: "TOGGLE_SELECT", payload: res.id }); }}
+          style={{
+            width: 22, height: 22, borderRadius: 6, flexShrink: 0,
+            border: `2px solid ${isChecked ? palette.accent : palette.border}`,
+            background: isChecked ? palette.accent : "transparent",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "pointer", transition: "all 0.15s",
+          }}
+        >
+          {isChecked && <span style={{ color: "#fff", fontSize: 13, fontWeight: 700, lineHeight: 1 }}>✓</span>}
+        </div>
+        {/* Avatar */}
+        <div style={{
+          width: 42, height: 42, borderRadius: "50%",
+          background: `linear-gradient(135deg, ${palette.accent}20, ${palette.accent}40)`,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 16, fontWeight: 600, color: palette.accent,
+          fontFamily: "'Montserrat', sans-serif", flexShrink: 0,
+        }}>
+          {res.name.split(" ").map((n) => n[0]).join("")}
+        </div>
+
+        {/* Info */}
+        <div style={{ flex: 1, minWidth: 150 }}>
+          <div style={{
+            display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+          }}>
+            <span style={{
+              fontWeight: 600, fontSize: 15, color: palette.dark,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>{res.name}</span>
+            {res.notes && (
+              <span style={{
+                fontSize: 10, padding: "2px 8px", borderRadius: 10,
+                background: palette.accentLight, color: palette.accent,
+                fontWeight: 600, fontFamily: "'Open Sans', sans-serif",
+              }}>{res.notes}</span>
+            )}
+          </div>
+          <div style={{
+            fontSize: 13, color: palette.muted, marginTop: 2,
+            fontFamily: "'Open Sans', sans-serif",
+          }}>
+            {res.service} · {res.guests} guest{res.guests > 1 ? "s" : ""}
+          </div>
+        </div>
+
+        {/* Date/Time */}
+        <div style={{ textAlign: "right", minWidth: 100 }}>
+          <div style={{
+            fontSize: 13, fontWeight: 600, color: palette.dark,
+            fontFamily: "'Open Sans', sans-serif",
+          }}>{dateStr}</div>
+          <div style={{
+            fontSize: 12, color: res.timeUpdated ? palette.accent : palette.muted,
+            fontFamily: "'Open Sans', sans-serif",
+            fontWeight: res.timeUpdated ? 600 : 400,
+          }}>
+            {timeStr}
+            {res.timeUpdated && <span style={{ fontSize: 9, marginLeft: 3 }}>⏱ updated</span>}
+          </div>
+        </div>
+
+        {/* Message Status & SMS */}
+        <div style={{ minWidth: 110, textAlign: "center", display: "flex", gap: 6, alignItems: "center", justifyContent: "center" }}>
+          {res.messageSent ? (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                dispatch({ type: "OPEN_SMS", payload: res.id });
+              }}
+              style={{
+                padding: "5px 12px", borderRadius: 8,
+                border: `1.5px solid ${palette.green}40`,
+                background: palette.greenLight, color: palette.green,
+                fontSize: 11, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif",
+                display: "flex", alignItems: "center", gap: 4,
+                transition: "all 0.15s",
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = palette.green; e.currentTarget.style.color = "#fff"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = palette.greenLight; e.currentTarget.style.color = palette.green; }}
+            >
+              💬 {(res.smsLog || []).length > 1 ? `${(res.smsLog || []).filter(m => m.from === "member").length} replies` : "View"}
+            </button>
+          ) : (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                dispatch({ type: "SEND_SMS", payload: { id: res.id } });
+              }}
+              style={{
+                padding: "6px 14px", borderRadius: 8,
+                border: `1.5px solid ${palette.accent}`,
+                background: "transparent", color: palette.accent,
+                fontSize: 12, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif",
+                transition: "all 0.15s",
+              }}
+              onMouseEnter={(e) => { e.target.style.background = palette.accent; e.target.style.color = "#fff"; }}
+              onMouseLeave={(e) => { e.target.style.background = "transparent"; e.target.style.color = palette.accent; }}
+            >
+              Send SMS
+            </button>
+          )}
+        </div>
+
+        {/* Status */}
+        <StatusBadge status={res.status} />
+      </div>
+
+      {/* Expanded Detail */}
+      {isSelected && (
+        <div style={{
+          marginTop: 16, paddingTop: 16,
+          borderTop: `1px solid ${palette.border}`,
+          display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+          gap: 16, animation: "fadeIn 0.2s ease-out",
+        }}>
+          <div>
+            <div style={{ fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 4, fontFamily: "'Open Sans', sans-serif" }}>Contact</div>
+            <div style={{ fontSize: 13, color: palette.dark, fontFamily: "'Open Sans', sans-serif" }}>{res.email}</div>
+            <div style={{ fontSize: 13, color: palette.dark, fontFamily: "'Open Sans', sans-serif" }}>{res.phone}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 4, fontFamily: "'Open Sans', sans-serif" }}>Confirmation Channel</div>
+            <div style={{ fontSize: 13, color: palette.dark, fontFamily: "'Open Sans', sans-serif", textTransform: "capitalize" }}>{res.channel === "both" ? "SMS & Email" : res.channel.toUpperCase()}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 4, fontFamily: "'Open Sans', sans-serif" }}>Reservation ID</div>
+            <div style={{ fontSize: 13, color: palette.dark, fontFamily: "'Open Sans', sans-serif", fontVariantNumeric: "tabular-nums" }}>{res.id}</div>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "end", justifyContent: "flex-end", flexWrap: "wrap" }}>
+            {res.status !== "confirmed" && res.status !== "cancelled" && (
+              <button
+                onClick={(e) => { e.stopPropagation(); dispatch({ type: "UPDATE_STATUS", payload: { id: res.id, status: "confirmed" } }); }}
+                style={{
+                  padding: "8px 18px", borderRadius: 8, border: "none",
+                  background: palette.green, color: "#fff", fontSize: 12,
+                  fontWeight: 600, cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+                }}
+              >Mark Confirmed</button>
+            )}
+            {res.status !== "cancelled" && (
+              <button
+                onClick={(e) => { e.stopPropagation(); dispatch({ type: "UPDATE_STATUS", payload: { id: res.id, status: "cancelled" } }); }}
+                style={{
+                  padding: "8px 18px", borderRadius: 8,
+                  border: `1.5px solid ${palette.red}`, background: "transparent",
+                  color: palette.red, fontSize: 12, fontWeight: 600,
+                  cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+                }}
+              >Cancel</button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Automation Panel ────────────────────────────────────────────
+function AutomationPanel({ reservations }) {
+  const [rules, setRules] = useState([
+    { id: 1, name: "48-Hour Reminder", desc: "Send confirmation request 48 hours before reservation", active: true, channel: "SMS & Email" },
+    { id: 2, name: "24-Hour Follow-up", desc: "Re-send to unconfirmed guests 24 hours before", active: true, channel: "SMS" },
+    { id: 3, name: "Same-Day Final Notice", desc: "Final reminder on the day of reservation", active: false, channel: "Email" },
+  ]);
+
+  const toggleRule = (id) => {
+    setRules(rules.map((r) => r.id === id ? { ...r, active: !r.active } : r));
+  };
+
+  return (
+    <div>
+      <div style={{
+        fontSize: 20, fontWeight: 600, color: palette.dark,
+        fontFamily: "'Montserrat', sans-serif", marginBottom: 4,
+      }}>Automation Rules</div>
+      <div style={{
+        fontSize: 13, color: palette.muted, marginBottom: 24,
+        fontFamily: "'Open Sans', sans-serif",
+      }}>Configure when automated confirmation messages are sent</div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {rules.map((rule) => (
+          <div key={rule.id} style={{
+            background: palette.card, borderRadius: 14, padding: "18px 22px",
+            border: `1px solid ${palette.border}`, boxShadow: palette.shadow,
+            display: "flex", alignItems: "center", gap: 16,
+          }}>
+            <button
+              onClick={() => toggleRule(rule.id)}
+              style={{
+                width: 44, height: 24, borderRadius: 12, border: "none",
+                background: rule.active ? palette.green : palette.border,
+                cursor: "pointer", position: "relative", transition: "background 0.2s",
+                flexShrink: 0,
+              }}
+            >
+              <div style={{
+                width: 18, height: 18, borderRadius: "50%", background: "#fff",
+                position: "absolute", top: 3,
+                left: rule.active ? 23 : 3,
+                transition: "left 0.2s", boxShadow: "0 1px 3px rgba(0,0,0,0.15)",
+              }} />
+            </button>
+            <div style={{ flex: 1 }}>
+              <div style={{
+                fontWeight: 600, fontSize: 14, color: palette.dark,
+                fontFamily: "'Open Sans', sans-serif",
+              }}>{rule.name}</div>
+              <div style={{
+                fontSize: 12, color: palette.muted, marginTop: 2,
+                fontFamily: "'Open Sans', sans-serif",
+              }}>{rule.desc}</div>
+            </div>
+            <span style={{
+              fontSize: 11, padding: "4px 10px", borderRadius: 8,
+              background: palette.blueLight, color: palette.blue,
+              fontWeight: 500, fontFamily: "'Open Sans', sans-serif",
+            }}>{rule.channel}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Message Template Preview */}
+      <div style={{
+        marginTop: 28, background: palette.card, borderRadius: 14,
+        padding: "22px 24px", border: `1px solid ${palette.border}`,
+        boxShadow: palette.shadow,
+      }}>
+        <div style={{
+          fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 1,
+          textTransform: "uppercase", marginBottom: 12, fontFamily: "'Open Sans', sans-serif",
+        }}>SMS Template Preview</div>
+        <div style={{
+          background: "#E8EDF4", borderRadius: 12, padding: 18,
+          border: `1px solid ${palette.border}`,
+        }}>
+          <div style={{
+            fontSize: 13, color: palette.dark, lineHeight: 1.7,
+            fontFamily: "'Open Sans', sans-serif",
+          }}>
+            <span style={{ fontWeight: 600 }}>Hi {'{{name}}'},</span><br /><br />
+            This is a reminder about your upcoming <span style={{ fontWeight: 600 }}>{'{{service}}'}</span> on{" "}
+            <span style={{ fontWeight: 600 }}>{'{{date}}'}</span> at <span style={{ fontWeight: 600 }}>{'{{time}}'}</span> for{" "}
+            <span style={{ fontWeight: 600 }}>{'{{guests}}'}</span> guest(s).<br /><br />
+            Reply:<br />
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              • <span style={{ background: palette.greenLight, padding: "1px 8px", borderRadius: 4, fontWeight: 600 }}>CONFIRM</span> to confirm
+            </span><br />
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              • <span style={{ background: palette.redLight, padding: "1px 8px", borderRadius: 4, fontWeight: 600 }}>CANCEL</span> to cancel
+            </span><br />
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              • <span style={{ background: palette.blueLight, padding: "1px 8px", borderRadius: 4, fontWeight: 600 }}>TIME 7:30 PM</span> to update your arrival
+            </span><br /><br />
+            <span style={{ color: palette.muted }}>— Freedom Boat Club</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Stats */}
+      <div style={{
+        marginTop: 24, display: "grid", gridTemplateColumns: "1fr 1fr",
+        gap: 12,
+      }}>
+        <div style={{
+          background: palette.greenLight, borderRadius: 12, padding: "16px 20px",
+          textAlign: "center",
+        }}>
+          <div style={{ fontSize: 24, fontWeight: 700, color: palette.green, fontFamily: "'Montserrat', sans-serif" }}>
+            {reservations.filter((r) => r.messageSent).length}
+          </div>
+          <div style={{ fontSize: 11, color: palette.green, fontWeight: 500, fontFamily: "'Open Sans', sans-serif" }}>
+            Messages Sent
+          </div>
+        </div>
+        <div style={{
+          background: palette.amberLight, borderRadius: 12, padding: "16px 20px",
+          textAlign: "center",
+        }}>
+          <div style={{ fontSize: 24, fontWeight: 700, color: palette.amber, fontFamily: "'Montserrat', sans-serif" }}>
+            {((reservations.filter((r) => r.status === "confirmed").length / reservations.length) * 100).toFixed(0)}%
+          </div>
+          <div style={{ fontSize: 11, color: palette.amber, fontWeight: 500, fontFamily: "'Open Sans', sans-serif" }}>
+            Confirmation Rate
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SMS Compose Modal ──────────────────────────────────────────
+function SmsComposeModal({ compose, reservations, dispatch, onSend }) {
+  const { id, mode } = compose;
+
+  // Build default message for single or first reservation
+  const res = mode === "single" ? reservations.find((r) => r.id === id) : null;
+  const buildDefault = (r) => {
+    const dateStr = new Date(r.date).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+    const timeStr = new Date(r.date).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    return (
+      `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\n` +
+      `Reply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`
+    );
+  };
+
+  const defaultBody = res ? buildDefault(res) : buildDefault(reservations.find((r) => !r.messageSent) || reservations[0]);
+  const [body, setBody] = useState(defaultBody);
+  const [sending, setSending] = useState(false);
+
+  const charCount = body.length;
+  const segments = Math.ceil(charCount / 160);
+
+  // For bulk, figure out targets
+  const bulkIds = mode === "bulk" ? (Array.isArray(id) ? id : []) : [];
+  const bulkTargets = bulkIds.map((bid) => reservations.find((r) => r.id === bid)).filter(Boolean);
+  const recipientCount = mode === "single" ? 1 : bulkTargets.length;
+
+  const handleSend = async () => {
+    setSending(true);
+    if (mode === "single") {
+      await onSend({ type: "SEND_SMS_CUSTOM", id, body });
+    } else {
+      await onSend({ type: "SEND_BULK_CUSTOM", ids: bulkIds, body });
+    }
+    setSending(false);
+    dispatch({ type: "CLOSE_COMPOSE" });
+  };
+
+  return (
+    <>
+      <div
+        onClick={() => dispatch({ type: "CLOSE_COMPOSE" })}
+        style={{
+          position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+          background: "rgba(0,0,0,0.4)", zIndex: 1100,
+          animation: "fadeIn 0.2s ease-out",
+        }}
+      />
+      <div style={{
+        position: "fixed", top: "50%", left: "50%",
+        transform: "translate(-50%, -50%)",
+        width: "90%", maxWidth: 540,
+        background: palette.card, borderRadius: 20,
+        boxShadow: "0 24px 80px rgba(0,0,0,0.2)",
+        zIndex: 1101, animation: "fadeIn 0.2s ease-out",
+        overflow: "hidden",
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: "20px 24px 16px",
+          borderBottom: `1px solid ${palette.border}`,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+        }}>
+          <div>
+            <div style={{
+              fontSize: 18, fontWeight: 700, color: palette.dark,
+              fontFamily: "'Montserrat', sans-serif",
+            }}>Compose SMS</div>
+            <div style={{
+              fontSize: 12, color: palette.muted, marginTop: 2,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>
+              {mode === "single"
+                ? `To: ${res?.name} · ${res?.phone}`
+                : `To: ${recipientCount} recipient${recipientCount !== 1 ? "s" : ""}`}
+            </div>
+          </div>
+          <button
+            onClick={() => dispatch({ type: "CLOSE_COMPOSE" })}
+            style={{
+              background: "none", border: "none", fontSize: 24,
+              color: palette.muted, cursor: "pointer", lineHeight: 1,
+            }}
+          >×</button>
+        </div>
+
+        {/* Recipient pills for bulk */}
+        {mode === "bulk" && (
+          <div style={{
+            padding: "12px 24px", borderBottom: `1px solid ${palette.border}`,
+            display: "flex", flexWrap: "wrap", gap: 6, maxHeight: 80, overflowY: "auto",
+          }}>
+            {bulkTargets.map((r) => (
+              <span key={r.id} style={{
+                padding: "3px 10px", borderRadius: 12, fontSize: 11,
+                background: palette.accentLight, color: palette.accent,
+                fontWeight: 500, fontFamily: "'Open Sans', sans-serif",
+              }}>{r.name}</span>
+            ))}
+          </div>
+        )}
+
+        {/* Message Editor */}
+        <div style={{ padding: "16px 24px" }}>
+          <div style={{
+            fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 0.8,
+            textTransform: "uppercase", marginBottom: 8, fontFamily: "'Open Sans', sans-serif",
+          }}>Message</div>
+          <textarea
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            style={{
+              width: "100%", minHeight: 180, padding: 16, borderRadius: 12,
+              border: `1.5px solid ${palette.border}`, background: "#F5F8FB",
+              fontSize: 13, lineHeight: 1.7, fontFamily: "'Open Sans', sans-serif",
+              color: palette.dark, resize: "vertical", outline: "none",
+              boxSizing: "border-box",
+            }}
+            onFocus={(e) => e.target.style.borderColor = palette.accent}
+            onBlur={(e) => e.target.style.borderColor = palette.border}
+          />
+          <div style={{
+            display: "flex", justifyContent: "space-between", marginTop: 8,
+            fontSize: 11, fontFamily: "'Open Sans', sans-serif",
+          }}>
+            <span style={{ color: palette.muted }}>
+              {charCount} characters · {segments} segment{segments !== 1 ? "s" : ""}
+            </span>
+            <button
+              onClick={() => setBody(defaultBody)}
+              style={{
+                background: "none", border: "none", color: palette.accent,
+                fontSize: 11, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif",
+              }}
+            >Reset to default</button>
+          </div>
+
+          {/* Tip */}
+          <div style={{
+            marginTop: 12, padding: "10px 14px", borderRadius: 10,
+            background: palette.amberLight, fontSize: 11, lineHeight: 1.5,
+            color: palette.amber, fontFamily: "'Open Sans', sans-serif",
+          }}>
+            <span style={{ fontWeight: 700 }}>Tip:</span> Keep the reply instructions (CONFIRM / CANCEL / TIME) so the system can process member responses automatically.
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{
+          padding: "16px 24px", borderTop: `1px solid ${palette.border}`,
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+        }}>
+          <button
+            onClick={() => dispatch({ type: "CLOSE_COMPOSE" })}
+            style={{
+              padding: "10px 20px", borderRadius: 10,
+              border: `1.5px solid ${palette.border}`, background: "transparent",
+              color: palette.muted, fontSize: 13, fontWeight: 600,
+              cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+            }}
+          >Cancel</button>
+          <button
+            onClick={handleSend}
+            disabled={sending || !body.trim()}
+            style={{
+              padding: "10px 28px", borderRadius: 10, border: "none",
+              background: sending || !body.trim() ? palette.border : palette.accent,
+              color: sending || !body.trim() ? palette.muted : "#fff",
+              fontSize: 13, fontWeight: 600,
+              cursor: sending || !body.trim() ? "default" : "pointer",
+              fontFamily: "'Open Sans', sans-serif",
+              boxShadow: sending || !body.trim() ? "none" : `0 4px 16px ${palette.accent}40`,
+              display: "flex", alignItems: "center", gap: 8,
+            }}
+          >
+            {sending ? "Sending..." : `Send${recipientCount > 1 ? ` to ${recipientCount}` : ""}`} →
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── SMS Drawer ─────────────────────────────────────────────────
+function SmsDrawer({ reservation, dispatch }) {
+  const [replyText, setReplyText] = useState("");
+  const scrollRef = useRef(null);
+  const res = reservation;
+  const log = res.smsLog || [];
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [log.length]);
+
+  const handleSend = () => {
+    const text = replyText.trim();
+    if (!text) return;
+    dispatch({ type: "SIMULATE_REPLY", payload: { id: res.id, reply: text } });
+    setReplyText("");
+  };
+
+  const dateStr = res.date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+  const timeStr = res.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+
+  return (
+    <div style={{
+      position: "fixed", top: 0, right: 0, bottom: 0, width: "100%", maxWidth: 420,
+      background: palette.card, zIndex: 1000, display: "flex", flexDirection: "column",
+      boxShadow: "-8px 0 40px rgba(0,0,0,0.15)",
+      animation: "slideIn 0.25s ease-out",
+    }}>
+      <style>{`@keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }`}</style>
+
+      {/* Header */}
+      <div style={{
+        padding: "18px 20px", borderBottom: `1px solid ${palette.border}`,
+        display: "flex", alignItems: "center", gap: 12, flexShrink: 0,
+      }}>
+        <button
+          onClick={() => dispatch({ type: "CLOSE_SMS" })}
+          style={{
+            background: "none", border: "none", fontSize: 22, cursor: "pointer",
+            color: palette.muted, padding: 0, lineHeight: 1,
+          }}
+        >←</button>
+        <div style={{
+          width: 38, height: 38, borderRadius: "50%",
+          background: `linear-gradient(135deg, ${palette.accent}20, ${palette.accent}40)`,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 14, fontWeight: 600, color: palette.accent,
+          fontFamily: "'Montserrat', sans-serif", flexShrink: 0,
+        }}>
+          {res.name.split(" ").map((n) => n[0]).join("")}
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, color: palette.dark, fontFamily: "'Open Sans', sans-serif" }}>{res.name}</div>
+          <div style={{ fontSize: 11, color: palette.muted, fontFamily: "'Open Sans', sans-serif" }}>{res.phone || "No phone number"}</div>
+        </div>
+        <StatusBadge status={res.status} />
+      </div>
+
+      {/* Reservation Info Bar */}
+      <div style={{
+        padding: "12px 20px", background: "#F5F8FB",
+        borderBottom: `1px solid ${palette.border}`,
+        display: "flex", gap: 16, fontSize: 12, fontFamily: "'Open Sans', sans-serif",
+        flexShrink: 0, flexWrap: "wrap",
+      }}>
+        <div><span style={{ color: palette.muted }}>Date:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{dateStr}</span></div>
+        <div>
+          <span style={{ color: palette.muted }}>Time:</span>{" "}
+          <span style={{ fontWeight: 600, color: res.timeUpdated ? palette.accent : palette.dark }}>
+            {timeStr}
+            {res.timeUpdated && <span style={{ fontSize: 10, marginLeft: 4, color: palette.accent }}>updated</span>}
+          </span>
+        </div>
+        <div><span style={{ color: palette.muted }}>Guests:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.guests}</span></div>
+        <div><span style={{ color: palette.muted }}>Service:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.service}</span></div>
+      </div>
+
+      {/* Message Thread */}
+      <div ref={scrollRef} style={{
+        flex: 1, overflowY: "auto", padding: "20px 16px",
+        display: "flex", flexDirection: "column", gap: 10,
+        background: "#E8EDF4",
+      }}>
+        {log.length === 0 ? (
+          <div style={{
+            textAlign: "center", padding: "60px 20px", color: palette.muted,
+            fontFamily: "'Open Sans', sans-serif", fontSize: 13,
+          }}>
+            <div style={{ fontSize: 36, marginBottom: 12, opacity: 0.4 }}>💬</div>
+            No messages sent yet.
+            {!res.messageSent && (
+              <div style={{ marginTop: 12 }}>
+                <button
+                  onClick={() => dispatch({ type: "SEND_SMS", payload: { id: res.id } })}
+                  style={{
+                    padding: "10px 24px", borderRadius: 10, border: "none",
+                    background: palette.accent, color: "#fff",
+                    fontSize: 13, fontWeight: 600, cursor: "pointer",
+                    fontFamily: "'Open Sans', sans-serif",
+                  }}
+                >Send Confirmation SMS</button>
+              </div>
+            )}
+          </div>
+        ) : (
+          log.map((msg, i) => (
+            <div key={i} style={{
+              display: "flex",
+              justifyContent: msg.from === "system" ? "flex-start" : "flex-end",
+            }}>
+              <div style={{
+                maxWidth: "80%", padding: "10px 14px", borderRadius: 16,
+                borderBottomLeftRadius: msg.from === "system" ? 4 : 16,
+                borderBottomRightRadius: msg.from === "member" ? 4 : 16,
+                background: msg.from === "system" ? palette.card : palette.accent,
+                color: msg.from === "system" ? palette.dark : "#fff",
+                fontSize: 13, lineHeight: 1.6, fontFamily: "'Open Sans', sans-serif",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
+                whiteSpace: "pre-wrap",
+              }}>
+                {msg.text}
+                <div style={{
+                  fontSize: 10, marginTop: 4, textAlign: "right",
+                  color: msg.from === "system" ? palette.muted : "rgba(255,255,255,0.7)",
+                }}>
+                  {new Date(msg.time).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Quick Reply Chips */}
+      {res.messageSent && (
+        <div style={{
+          padding: "10px 16px 4px", background: palette.card,
+          borderTop: `1px solid ${palette.border}`,
+          display: "flex", gap: 6, flexWrap: "wrap", flexShrink: 0,
+        }}>
+          <div style={{ fontSize: 10, color: palette.muted, fontFamily: "'Open Sans', sans-serif", width: "100%", marginBottom: 2 }}>
+            Simulate member reply:
+          </div>
+          {["CONFIRM", "CANCEL", "TIME 7:30 PM", "TIME 6:00 PM"].map((chip) => (
+            <button
+              key={chip}
+              onClick={() => {
+                dispatch({ type: "SIMULATE_REPLY", payload: { id: res.id, reply: chip } });
+              }}
+              style={{
+                padding: "6px 12px", borderRadius: 20,
+                border: `1.5px solid ${chip === "CONFIRM" ? palette.green : chip === "CANCEL" ? palette.red : palette.blue}`,
+                background: "transparent",
+                color: chip === "CONFIRM" ? palette.green : chip === "CANCEL" ? palette.red : palette.blue,
+                fontSize: 11, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+              }}
+            >{chip}</button>
+          ))}
+        </div>
+      )}
+
+      {/* Reply Input */}
+      {res.messageSent && (
+        <div style={{
+          padding: "12px 16px", background: palette.card,
+          borderTop: `1px solid ${palette.border}`,
+          display: "flex", gap: 10, alignItems: "center", flexShrink: 0,
+        }}>
+          <input
+            type="text"
+            placeholder="Type a member reply to simulate..."
+            value={replyText}
+            onChange={(e) => setReplyText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSend()}
+            style={{
+              flex: 1, padding: "10px 16px", borderRadius: 24,
+              border: `1.5px solid ${palette.border}`, background: "#F0F4F8",
+              fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+              color: palette.dark, outline: "none",
+            }}
+            onFocus={(e) => e.target.style.borderColor = palette.accent}
+            onBlur={(e) => e.target.style.borderColor = palette.border}
+          />
+          <button
+            onClick={handleSend}
+            style={{
+              width: 40, height: 40, borderRadius: "50%", border: "none",
+              background: replyText.trim() ? palette.accent : palette.border,
+              color: "#fff", fontSize: 16, cursor: replyText.trim() ? "pointer" : "default",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              transition: "background 0.15s", flexShrink: 0,
+            }}
+          >↑</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── SMS Drawer Overlay ──────────────────────────────────────────
+function SmsOverlay({ onClose }) {
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+        background: "rgba(0,0,0,0.3)", zIndex: 999,
+        animation: "fadeIn 0.2s ease-out",
+      }}
+    />
+  );
+}
+
+// ─── Upload Panel ────────────────────────────────────────────────
+function UploadPanel({ dispatch }) {
+  const [step, setStep] = useState("upload"); // upload | mapping | preview
+  const [dragOver, setDragOver] = useState(false);
+  const [fileName, setFileName] = useState("");
+  const [headers, setHeaders] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [mapping, setMapping] = useState({});
+  const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
+
+  const processFile = useCallback((file) => {
+    setError("");
+    if (!file) return;
+    const validTypes = [
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel",
+      "text/csv",
+    ];
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (!validTypes.includes(file.type) && !["xlsx", "xls", "csv"].includes(ext)) {
+      setError("Please upload an Excel (.xlsx, .xls) or CSV file.");
+      return;
+    }
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, { type: "array", cellDates: true });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+        if (json.length === 0) {
+          setError("The file appears to be empty. Please check your data.");
+          return;
+        }
+        const hdrs = Object.keys(json[0]);
+        setHeaders(hdrs);
+        setRows(json);
+        const autoMap = autoMapColumns(hdrs);
+        setMapping(autoMap);
+        setStep("mapping");
+      } catch (err) {
+        setError("Could not read the file. Please make sure it's a valid Excel or CSV file.");
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) processFile(file);
+  }, [processFile]);
+
+  const handleFileInput = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (file) processFile(file);
+  }, [processFile]);
+
+  const handleImport = () => {
+    if (!mapping.name || !mapping.date) {
+      setError("Guest Name and Date are required fields. Please map them before importing.");
+      return;
+    }
+    const reservations = rowsToReservations(rows, mapping);
+    if (reservations.length === 0) {
+      setError("No valid reservations found. Check that your date and name columns contain data.");
+      return;
+    }
+    dispatch({ type: "LOAD_DATA", payload: reservations });
+  };
+
+  const mappedCount = EXPECTED_FIELDS.filter((f) => mapping[f.key]).length;
+  const requiredMapped = EXPECTED_FIELDS.filter((f) => f.required && mapping[f.key]).length;
+  const requiredTotal = EXPECTED_FIELDS.filter((f) => f.required).length;
+
+  // ── Upload Step ──
+  if (step === "upload") {
+    return (
+      <div style={{ maxWidth: 640, margin: "0 auto", padding: "40px 0" }}>
+        <div style={{ textAlign: "center", marginBottom: 32 }}>
+          <div style={{
+            width: 64, height: 64, borderRadius: 20, margin: "0 auto 16px",
+            background: `linear-gradient(135deg, ${palette.accentLight}, ${palette.greenLight})`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 28,
+          }}>📊</div>
+          <h2 style={{
+            fontSize: 26, fontWeight: 700, color: palette.dark,
+            fontFamily: "'Montserrat', sans-serif", marginBottom: 8,
+          }}>Import Reservations</h2>
+          <p style={{
+            fontSize: 14, color: palette.muted, fontFamily: "'Open Sans', sans-serif",
+            lineHeight: 1.6, maxWidth: 420, margin: "0 auto",
+          }}>
+            Upload an Excel or CSV file with your upcoming reservation data.
+            We'll auto-detect your columns and let you review before importing.
+          </p>
+        </div>
+
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          onClick={() => fileInputRef.current?.click()}
+          style={{
+            border: `2px dashed ${dragOver ? palette.accent : palette.border}`,
+            borderRadius: 20, padding: "52px 32px", textAlign: "center",
+            background: dragOver ? palette.accentLight + "40" : palette.card,
+            cursor: "pointer", transition: "all 0.2s",
+            boxShadow: dragOver ? palette.shadowHover : palette.shadow,
+          }}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            onChange={handleFileInput}
+            style={{ display: "none" }}
+          />
+          <div style={{
+            fontSize: 44, marginBottom: 16, opacity: dragOver ? 1 : 0.6,
+            transition: "opacity 0.2s",
+          }}>{dragOver ? "📥" : "📄"}</div>
+          <div style={{
+            fontSize: 16, fontWeight: 600, color: palette.dark,
+            fontFamily: "'Open Sans', sans-serif", marginBottom: 6,
+          }}>
+            {dragOver ? "Drop your file here" : "Drag & drop your file here"}
+          </div>
+          <div style={{
+            fontSize: 13, color: palette.muted, fontFamily: "'Open Sans', sans-serif",
+          }}>
+            or <span style={{ color: palette.accent, fontWeight: 600 }}>click to browse</span> · .xlsx, .xls, .csv
+          </div>
+        </div>
+
+        {error && (
+          <div style={{
+            marginTop: 16, padding: "12px 18px", borderRadius: 12,
+            background: palette.redLight, color: palette.red,
+            fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+            border: `1px solid ${palette.red}20`,
+          }}>⚠ {error}</div>
+        )}
+
+        {/* Expected format hint */}
+        <div style={{
+          marginTop: 28, background: palette.card, borderRadius: 14,
+          padding: "18px 22px", border: `1px solid ${palette.border}`,
+          boxShadow: palette.shadow,
+        }}>
+          <div style={{
+            fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 1,
+            textTransform: "uppercase", marginBottom: 10, fontFamily: "'Open Sans', sans-serif",
+          }}>Expected Columns</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {EXPECTED_FIELDS.map((f) => (
+              <span key={f.key} style={{
+                padding: "4px 12px", borderRadius: 8, fontSize: 12,
+                fontFamily: "'Open Sans', sans-serif", fontWeight: 500,
+                background: f.required ? palette.accentLight : "#F0EEEA",
+                color: f.required ? palette.accent : palette.muted,
+              }}>
+                {f.label}{f.required ? " *" : ""}
+              </span>
+            ))}
+          </div>
+          <div style={{
+            fontSize: 11, color: palette.muted, marginTop: 10,
+            fontFamily: "'Open Sans', sans-serif",
+          }}>
+            * Required fields. Other columns are optional — we'll auto-detect matching headers.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Mapping Step ──
+  if (step === "mapping") {
+    return (
+      <div style={{ maxWidth: 720, margin: "0 auto", padding: "32px 0" }}>
+        <div style={{ marginBottom: 28 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4 }}>
+            <button
+              onClick={() => setStep("upload")}
+              style={{
+                background: "none", border: "none", color: palette.muted,
+                fontSize: 13, cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+                display: "flex", alignItems: "center", gap: 4,
+              }}
+            >← Back</button>
+          </div>
+          <h2 style={{
+            fontSize: 24, fontWeight: 700, color: palette.dark,
+            fontFamily: "'Montserrat', sans-serif", marginBottom: 6,
+          }}>Map Your Columns</h2>
+          <p style={{
+            fontSize: 13, color: palette.muted, fontFamily: "'Open Sans', sans-serif",
+          }}>
+            <span style={{ fontWeight: 600, color: palette.dark }}>{fileName}</span> · {rows.length} rows found · {mappedCount} of {EXPECTED_FIELDS.length} fields mapped
+          </p>
+        </div>
+
+        {/* Progress indicator */}
+        <div style={{
+          height: 4, borderRadius: 2, background: palette.border, marginBottom: 24, overflow: "hidden",
+        }}>
+          <div style={{
+            height: "100%", borderRadius: 2,
+            background: requiredMapped >= requiredTotal ? palette.green : palette.amber,
+            width: `${(mappedCount / EXPECTED_FIELDS.length) * 100}%`,
+            transition: "width 0.3s, background 0.3s",
+          }} />
+        </div>
+
+        {error && (
+          <div style={{
+            marginBottom: 16, padding: "12px 18px", borderRadius: 12,
+            background: palette.redLight, color: palette.red,
+            fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+          }}>⚠ {error}</div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {EXPECTED_FIELDS.map((field) => (
+            <div key={field.key} style={{
+              background: palette.card, borderRadius: 12, padding: "14px 18px",
+              border: `1px solid ${field.required && !mapping[field.key] ? palette.amber + "60" : palette.border}`,
+              display: "flex", alignItems: "center", gap: 16,
+              boxShadow: palette.shadow,
+            }}>
+              <div style={{ flex: 1, minWidth: 140 }}>
+                <div style={{
+                  fontSize: 13, fontWeight: 600, color: palette.dark,
+                  fontFamily: "'Open Sans', sans-serif",
+                  display: "flex", alignItems: "center", gap: 6,
+                }}>
+                  {field.label}
+                  {field.required && (
+                    <span style={{
+                      fontSize: 9, padding: "2px 6px", borderRadius: 4,
+                      background: mapping[field.key] ? palette.greenLight : palette.amberLight,
+                      color: mapping[field.key] ? palette.green : palette.amber,
+                      fontWeight: 700,
+                    }}>{mapping[field.key] ? "MAPPED" : "REQUIRED"}</span>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ color: palette.muted, fontSize: 16 }}>→</span>
+                <select
+                  value={mapping[field.key] || ""}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setMapping((prev) => {
+                      const next = { ...prev };
+                      if (val) next[field.key] = val;
+                      else delete next[field.key];
+                      return next;
+                    });
+                    setError("");
+                  }}
+                  style={{
+                    padding: "8px 14px", borderRadius: 8,
+                    border: `1.5px solid ${mapping[field.key] ? palette.green + "60" : palette.border}`,
+                    background: mapping[field.key] ? palette.greenLight + "40" : palette.card,
+                    fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+                    color: mapping[field.key] ? palette.dark : palette.muted,
+                    minWidth: 200, outline: "none", cursor: "pointer",
+                    appearance: "auto",
+                  }}
+                >
+                  <option value="">— Skip —</option>
+                  {headers.map((h) => (
+                    <option key={h} value={h}>{h}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Preview + Import */}
+        <div style={{ marginTop: 24, display: "flex", gap: 12, justifyContent: "space-between", alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ fontSize: 12, color: palette.muted, fontFamily: "'Open Sans', sans-serif" }}>
+            Preview: first {Math.min(3, rows.length)} of {rows.length} rows
+          </div>
+          <button
+            onClick={handleImport}
+            style={{
+              padding: "12px 32px", borderRadius: 12, border: "none",
+              background: requiredMapped >= requiredTotal ? palette.green : palette.border,
+              color: requiredMapped >= requiredTotal ? "#fff" : palette.muted,
+              fontSize: 14, fontWeight: 600, cursor: requiredMapped >= requiredTotal ? "pointer" : "default",
+              fontFamily: "'Open Sans', sans-serif",
+              boxShadow: requiredMapped >= requiredTotal ? `0 4px 16px ${palette.green}40` : "none",
+              transition: "all 0.2s",
+            }}
+          >
+            Import {rows.length} Reservations →
+          </button>
+        </div>
+
+        {/* Mini Preview Table */}
+        <div style={{
+          marginTop: 16, background: palette.card, borderRadius: 14,
+          border: `1px solid ${palette.border}`, overflow: "hidden",
+          boxShadow: palette.shadow,
+        }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, fontFamily: "'Open Sans', sans-serif" }}>
+              <thead>
+                <tr>
+                  {EXPECTED_FIELDS.filter((f) => mapping[f.key]).map((f) => (
+                    <th key={f.key} style={{
+                      padding: "10px 14px", textAlign: "left", fontWeight: 600,
+                      color: palette.muted, borderBottom: `1px solid ${palette.border}`,
+                      background: "#F5F8FB", fontSize: 11, letterSpacing: 0.3,
+                      textTransform: "uppercase", whiteSpace: "nowrap",
+                    }}>{f.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, 3).map((row, i) => (
+                  <tr key={i}>
+                    {EXPECTED_FIELDS.filter((f) => mapping[f.key]).map((f) => (
+                      <td key={f.key} style={{
+                        padding: "10px 14px", color: palette.dark,
+                        borderBottom: `1px solid ${palette.border}`,
+                        whiteSpace: "nowrap", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis",
+                      }}>
+                        {String(row[mapping[f.key]] ?? "—")}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+// ─── Bulk Action Bar ─────────────────────────────────────────────
+function BulkActionBar({ count, dispatch, reservations, selected }) {
+  const selectedRes = reservations.filter((r) => selected.has(r.id));
+  const confirmableCount = selectedRes.filter((r) => r.status !== "confirmed" && r.status !== "cancelled").length;
+  const unsentCount = selectedRes.filter((r) => !r.messageSent).length;
+
+  return (
+    <div style={{
+      position: "sticky", bottom: 20, zIndex: 100,
+      background: palette.dark, borderRadius: 16,
+      padding: "14px 24px", margin: "16px 0",
+      display: "flex", alignItems: "center", justifyContent: "space-between",
+      flexWrap: "wrap", gap: 12,
+      boxShadow: "0 8px 40px rgba(0,0,0,0.25), 0 2px 12px rgba(0,0,0,0.15)",
+      animation: "slideUp 0.25s ease-out",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{
+          background: palette.accent, borderRadius: 8,
+          width: 32, height: 32, display: "flex",
+          alignItems: "center", justifyContent: "center",
+          fontSize: 14, fontWeight: 700, color: "#fff",
+          fontFamily: "'Open Sans', sans-serif",
+        }}>{count}</div>
+        <span style={{
+          color: "#fff", fontSize: 14, fontWeight: 500,
+          fontFamily: "'Open Sans', sans-serif",
+        }}>reservation{count !== 1 ? "s" : ""} selected</span>
+        <button
+          onClick={() => dispatch({ type: "DESELECT_ALL" })}
+          style={{
+            background: "transparent", border: "none", color: palette.muted,
+            fontSize: 12, cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+            textDecoration: "underline",
+          }}
+        >Clear</button>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {unsentCount > 0 && (
+          <button
+            onClick={() => dispatch({ type: "BULK_SEND" })}
+            style={{
+              padding: "9px 20px", borderRadius: 10, border: "1.5px solid #6B7280",
+              background: "transparent", color: "#fff",
+              fontSize: 13, fontWeight: 600, cursor: "pointer",
+              fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+            }}
+            onMouseEnter={(e) => { e.target.style.background = "#374151"; }}
+            onMouseLeave={(e) => { e.target.style.background = "transparent"; }}
+          >
+            Send Reminders ({unsentCount})
+          </button>
+        )}
+        {confirmableCount > 0 && (
+          <button
+            onClick={() => dispatch({ type: "BULK_CONFIRM" })}
+            style={{
+              padding: "9px 24px", borderRadius: 10, border: "none",
+              background: palette.green, color: "#fff",
+              fontSize: 13, fontWeight: 600, cursor: "pointer",
+              fontFamily: "'Open Sans', sans-serif",
+              boxShadow: `0 2px 10px ${palette.green}50`,
+              transition: "all 0.15s",
+            }}
+            onMouseEnter={(e) => { e.target.style.transform = "scale(1.03)"; }}
+            onMouseLeave={(e) => { e.target.style.transform = "scale(1)"; }}
+          >
+            ✓ Confirm All ({confirmableCount})
+          </button>
+        )}
+        <button
+          onClick={() => dispatch({ type: "BULK_CANCEL" })}
+          style={{
+            padding: "9px 20px", borderRadius: 10,
+            border: `1.5px solid ${palette.red}`, background: "transparent",
+            color: palette.red, fontSize: 13, fontWeight: 600,
+            cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+            transition: "all 0.15s",
+          }}
+          onMouseEnter={(e) => { e.target.style.background = palette.red; e.target.style.color = "#fff"; }}
+          onMouseLeave={(e) => { e.target.style.background = "transparent"; e.target.style.color = palette.red; }}
+        >
+          Cancel Selected
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main App ────────────────────────────────────────────────────
+function ReservationDashboard() {
+  const [state, dispatch] = useReducer(reducer, {
+    reservations: [],
+    filter: "all",
+    search: "",
+    selectedId: null,
+    selected: new Set(),
+    smsDrawer: null,
+    smsCompose: null, // { id, body, mode: "single"|"bulk" }
+    currentDock: null, // dock id
+    view: "dock-select", // start at dock selection
+    showToast: null,
+  });
+
+  const [apiStatus, setApiStatus] = useState(api.isLive() ? "connecting" : "local"); // local | connecting | connected | error
+
+  // Poll the backend API for reservation updates when in live mode
+  useEffect(() => {
+    if (!api.isLive() || !state.currentDock) return;
+
+    let active = true;
+
+    const checkHealth = async () => {
+      try {
+        const data = await api.healthCheck();
+        if (active) setApiStatus(data.twilioConfigured ? "connected" : "connected-no-twilio");
+      } catch {
+        if (active) setApiStatus("error");
+      }
+    };
+    checkHealth();
+
+    const poll = async () => {
+      try {
+        const data = await api.fetchReservations(state.currentDock);
+        if (active && data.reservations) {
+          const parsed = data.reservations.map((r) => ({
+            ...r,
+            date: new Date(r.date),
+            messageTime: r.messageTime ? new Date(r.messageTime) : null,
+            smsLog: (r.smsLog || []).map((m) => ({ ...m, time: new Date(m.time) })),
+          }));
+          dispatch({ type: "LOAD_DATA_SILENT", payload: parsed });
+        }
+      } catch { /* silently fail */ }
+    };
+
+    const interval = setInterval(poll, 5000);
+    return () => { active = false; clearInterval(interval); };
+  }, [state.currentDock]);
+
+  const filtered = state.reservations
+    .filter((r) => state.filter === "all" || r.status === state.filter)
+    .filter((r) =>
+      state.search === "" ||
+      r.name.toLowerCase().includes(state.search.toLowerCase()) ||
+      r.id.toLowerCase().includes(state.search.toLowerCase()) ||
+      r.service.toLowerCase().includes(state.search.toLowerCase())
+    )
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  const counts = {
+    all: state.reservations.length,
+    confirmed: state.reservations.filter((r) => r.status === "confirmed").length,
+    pending: state.reservations.filter((r) => r.status === "pending").length,
+    unconfirmed: state.reservations.filter((r) => r.status === "unconfirmed").length,
+    cancelled: state.reservations.filter((r) => r.status === "cancelled").length,
+  };
+
+  const unsent = state.reservations.filter((r) => !r.messageSent).length;
+
+  // Helper to refresh data from server
+  const refreshFromServer = async () => {
+    if (!state.currentDock) return;
+    try {
+      const data = await api.fetchReservations(state.currentDock);
+      if (data.reservations) dispatch({ type: "LOAD_DATA_SILENT", payload: data.reservations.map((r) => ({ ...r, date: new Date(r.date), messageTime: r.messageTime ? new Date(r.messageTime) : null, smsLog: (r.smsLog || []).map((m) => ({ ...m, time: new Date(m.time) })) })) });
+    } catch { /* silently fail */ }
+  };
+
+  // Wrap dispatch to intercept SMS actions and route to API when live
+  const liveDispatch = useCallback(async (action) => {
+    if (!api.isLive()) {
+      // In simulation mode, SEND_SMS and BULK_SEND still open compose
+      if (action.type === "SEND_SMS") {
+        dispatch({ type: "OPEN_COMPOSE", payload: { id: action.payload.id, mode: "single" } });
+        return;
+      }
+      if (action.type === "BULK_SEND") {
+        dispatch({ type: "OPEN_COMPOSE", payload: { id: [...state.selected], mode: "bulk" } });
+        return;
+      }
+      if (action.type === "SEND_ALL_REMINDERS") {
+        const unsentIds = state.reservations.filter((r) => !r.messageSent).map((r) => r.id);
+        dispatch({ type: "OPEN_COMPOSE", payload: { id: unsentIds, mode: "bulk" } });
+        return;
+      }
+      dispatch(action);
+      return;
+    }
+
+    switch (action.type) {
+      case "SEND_SMS": {
+        // Open compose modal instead of sending directly
+        dispatch({ type: "OPEN_COMPOSE", payload: { id: action.payload.id, mode: "single" } });
+        break;
+      }
+      case "SEND_SMS_CUSTOM": {
+        // Actually send with custom body
+        try {
+          const result = await api.sendSms(action.id, action.body, state.currentDock);
+          if (result.success) {
+            dispatch({ type: "SHOW_TOAST", payload: "SMS sent via Twilio!" });
+            await refreshFromServer();
+          } else {
+            dispatch({ type: "SHOW_TOAST", payload: `Failed: ${result.error}` });
+          }
+        } catch (err) {
+          dispatch({ type: "SHOW_TOAST", payload: "Network error sending SMS" });
+        }
+        break;
+      }
+      case "SEND_ALL_REMINDERS": {
+        // Open compose modal for all unsent
+        const unsentIds = state.reservations.filter((r) => !r.messageSent).map((r) => r.id);
+        dispatch({ type: "OPEN_COMPOSE", payload: { id: unsentIds, mode: "bulk" } });
+        break;
+      }
+      case "BULK_SEND": {
+        // Open compose modal for selected
+        dispatch({ type: "OPEN_COMPOSE", payload: { id: [...state.selected], mode: "bulk" } });
+        break;
+      }
+      case "SEND_BULK_CUSTOM": {
+        // Actually send bulk with custom body
+        try {
+          const result = await api.sendBulk(action.ids, state.currentDock);
+          if (result.success) {
+            dispatch({ type: "SHOW_TOAST", payload: `${result.sent} SMS sent via Twilio!` });
+            dispatch({ type: "DESELECT_ALL" });
+            await refreshFromServer();
+          }
+        } catch {
+          dispatch({ type: "SHOW_TOAST", payload: "Network error sending bulk SMS" });
+        }
+        break;
+      }
+      case "UPDATE_STATUS": {
+        try {
+          await api.updateStatus(action.payload.id, action.payload.status, state.currentDock);
+          dispatch(action);
+        } catch {
+          dispatch(action); // fallback to local
+        }
+        break;
+      }
+      case "LOAD_DATA": {
+        // Also send to backend
+        try {
+          await api.importReservations(action.payload, state.currentDock);
+        } catch { /* continue with local */ }
+        dispatch(action);
+        break;
+      }
+      default:
+        dispatch(action);
+    }
+  }, [state.selected, state.reservations]);
+
+  return (
+    <>
+      <link href={FONT_URL} rel="stylesheet" />
+      <style>{`
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes slideUp { from { opacity: 0; transform: translate(-50%, 20px); } to { opacity: 1; transform: translate(-50%, 0); } }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #D0CCC6; border-radius: 3px; }
+        body { background: ${palette.bg}; }
+      `}</style>
+
+      <div style={{
+        minHeight: "100vh", background: palette.bg,
+        fontFamily: "'Open Sans', sans-serif",
+        padding: "0 24px 40px",
+        maxWidth: 1200, margin: "0 auto",
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: "32px 0 28px", display: "flex", alignItems: "flex-end",
+          justifyContent: "space-between", flexWrap: "wrap", gap: 16,
+          borderBottom: `2px solid ${palette.dark}`, marginBottom: 28,
+        }}>
+          <div>
+            <div style={{
+              display: "flex", alignItems: "center", gap: 14, marginBottom: 10,
+            }}>
+              {/* FBC Logo */}
+              <img
+                src="data:image/png;base64,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"
+                alt="Freedom Boat Club"
+                style={{ height: 48, borderRadius: "50%", background: "#fff", padding: 2 }}
+                onError={(e) => { e.target.style.display = "none"; }}
+              />
+              {/* Connection Status */}
+              <div style={{
+                display: "flex", alignItems: "center", gap: 5,
+                padding: "3px 10px", borderRadius: 20, fontSize: 10, fontWeight: 600,
+                fontFamily: "'Open Sans', sans-serif",
+                background: apiStatus === "connected" ? palette.greenLight
+                  : apiStatus === "connected-no-twilio" ? palette.amberLight
+                  : apiStatus === "error" ? palette.redLight
+                  : apiStatus === "connecting" ? palette.amberLight
+                  : palette.blueLight,
+                color: apiStatus === "connected" ? palette.green
+                  : apiStatus === "connected-no-twilio" ? palette.amber
+                  : apiStatus === "error" ? palette.red
+                  : apiStatus === "connecting" ? palette.amber
+                  : palette.blue,
+              }}>
+                <span style={{
+                  width: 6, height: 6, borderRadius: "50%",
+                  background: apiStatus === "connected" ? palette.green
+                    : apiStatus === "connected-no-twilio" ? palette.amber
+                    : apiStatus === "error" ? palette.red
+                    : apiStatus === "connecting" ? palette.amber
+                    : palette.blue,
+                }} />
+                {apiStatus === "connected" ? "Twilio Live"
+                  : apiStatus === "connected-no-twilio" ? "Server OK · Twilio Not Configured"
+                  : apiStatus === "error" ? "Server Unreachable"
+                  : apiStatus === "connecting" ? "Connecting..."
+                  : "Simulation Mode"}
+              </div>
+            </div>
+            <h1 style={{
+              fontSize: 28, fontWeight: 700, color: palette.dark,
+              fontFamily: "'Montserrat', sans-serif", lineHeight: 1.1,
+              letterSpacing: -0.5,
+            }}>Reservation Confirmations</h1>
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button
+              onClick={() => dispatch({ type: "SET_VIEW", payload: "reservations" })}
+              style={{
+                padding: "10px 22px", borderRadius: 10, border: "none",
+                background: state.view === "reservations" ? palette.dark : "transparent",
+                color: state.view === "reservations" ? "#fff" : palette.muted,
+                fontSize: 13, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+              }}
+            >Reservations</button>
+            <button
+              onClick={() => dispatch({ type: "SET_VIEW", payload: "automation" })}
+              style={{
+                padding: "10px 22px", borderRadius: 10, border: "none",
+                background: state.view === "automation" ? palette.dark : "transparent",
+                color: state.view === "automation" ? "#fff" : palette.muted,
+                fontSize: 13, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+              }}
+            >Automation</button>
+            <button
+              onClick={() => dispatch({ type: "SET_VIEW", payload: "upload" })}
+              style={{
+                padding: "10px 22px", borderRadius: 10,
+                border: `1.5px solid ${state.view === "upload" ? palette.accent : palette.border}`,
+                background: state.view === "upload" ? palette.accentLight : "transparent",
+                color: state.view === "upload" ? palette.accent : palette.muted,
+                fontSize: 13, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+                display: "flex", alignItems: "center", gap: 6,
+              }}
+            >
+              <span style={{ fontSize: 15 }}>↑</span> Upload
+            </button>
+            {state.currentDock && (
+              <button
+                onClick={() => dispatch({ type: "SWITCH_DOCK" })}
+                style={{
+                  padding: "10px 18px", borderRadius: 10,
+                  border: `1.5px solid ${palette.border}`,
+                  background: "transparent",
+                  color: palette.muted,
+                  fontSize: 12, fontWeight: 600, cursor: "pointer",
+                  fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+                  display: "flex", alignItems: "center", gap: 6,
+                }}
+              >
+                <span style={{ fontSize: 13 }}>⚓</span> {DOCKS.find((d) => d.id === state.currentDock)?.name || "Switch Dock"}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Dock Selection Screen */}
+        {state.view === "dock-select" ? (
+          <div style={{
+            display: "flex", flexDirection: "column", alignItems: "center",
+            justifyContent: "center", padding: "60px 20px",
+          }}>
+            <div style={{
+              fontSize: 13, color: palette.accent, fontWeight: 700,
+              letterSpacing: 2, textTransform: "uppercase", marginBottom: 12,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>Select Your Location</div>
+            <div style={{
+              fontSize: 22, fontWeight: 700, color: palette.dark,
+              fontFamily: "'Montserrat', sans-serif", marginBottom: 32,
+              textAlign: "center",
+            }}>Which dock are you managing today?</div>
+            <div style={{
+              display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+              gap: 16, width: "100%", maxWidth: 700,
+            }}>
+              {DOCKS.map((dock) => (
+                <button
+                  key={dock.id}
+                  onClick={() => dispatch({ type: "SET_DOCK", payload: dock.id })}
+                  style={{
+                    padding: "28px 24px", borderRadius: 14,
+                    border: `2px solid ${palette.border}`,
+                    background: palette.card,
+                    cursor: "pointer", transition: "all 0.2s",
+                    textAlign: "left",
+                    boxShadow: palette.shadow,
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.borderColor = palette.accent;
+                    e.currentTarget.style.boxShadow = palette.shadowHover;
+                    e.currentTarget.style.transform = "translateY(-2px)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.borderColor = palette.border;
+                    e.currentTarget.style.boxShadow = palette.shadow;
+                    e.currentTarget.style.transform = "translateY(0)";
+                  }}
+                >
+                  <div style={{
+                    fontSize: 24, marginBottom: 10,
+                  }}>⚓</div>
+                  <div style={{
+                    fontSize: 16, fontWeight: 700, color: palette.dark,
+                    fontFamily: "'Montserrat', sans-serif", marginBottom: 4,
+                  }}>{dock.name}</div>
+                  <div style={{
+                    fontSize: 12, color: palette.muted,
+                    fontFamily: "'Open Sans', sans-serif",
+                  }}>Manage reservations & SMS</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : state.view === "upload" || (state.view === "reservations" && state.reservations.length === 0) ? (
+          <UploadPanel dispatch={(action) => {
+            liveDispatch(action);
+            if (action.type === "LOAD_DATA") dispatch({ type: "SET_VIEW", payload: "reservations" });
+          }} />
+        ) : state.view === "reservations" ? (
+          <>
+            {/* Stats */}
+            <div style={{ display: "flex", gap: 14, marginBottom: 28, flexWrap: "wrap" }}>
+              <StatCard label="Total" value={counts.all} sub="Upcoming reservations" color={palette.blueLight} />
+              <StatCard label="Confirmed" value={counts.confirmed} sub={`${counts.all > 0 ? ((counts.confirmed / counts.all) * 100).toFixed(0) : 0}% confirmed`} color={palette.greenLight} />
+              <StatCard label="Pending" value={counts.pending} sub="Awaiting response" color={palette.amberLight} />
+              <StatCard label="Unsent" value={unsent} sub="Messages not sent" color={palette.redLight} />
+            </div>
+
+            {/* Controls */}
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+              marginBottom: 16, flexWrap: "wrap", gap: 12,
+            }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {["all", "confirmed", "pending", "unconfirmed", "cancelled"].map((f) => (
+                  <button
+                    key={f}
+                    onClick={() => dispatch({ type: "SET_FILTER", payload: f })}
+                    style={{
+                      padding: "7px 16px", borderRadius: 8,
+                      border: `1.5px solid ${state.filter === f ? palette.accent : palette.border}`,
+                      background: state.filter === f ? palette.accentLight : "transparent",
+                      color: state.filter === f ? palette.accent : palette.muted,
+                      fontSize: 12, fontWeight: 600, cursor: "pointer",
+                      fontFamily: "'Open Sans', sans-serif",
+                      textTransform: "capitalize", transition: "all 0.15s",
+                    }}
+                  >
+                    {f === "all" ? "All" : statusConfig[f]?.label || f} ({counts[f]})
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <div style={{ position: "relative" }}>
+                  <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: palette.muted, fontSize: 14 }}>⌕</span>
+                  <input
+                    type="text"
+                    placeholder="Search name, ID, service..."
+                    value={state.search}
+                    onChange={(e) => dispatch({ type: "SET_SEARCH", payload: e.target.value })}
+                    style={{
+                      padding: "9px 14px 9px 34px", borderRadius: 10,
+                      border: `1.5px solid ${palette.border}`, background: palette.card,
+                      fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+                      color: palette.dark, width: 240, outline: "none",
+                      transition: "border-color 0.15s",
+                    }}
+                    onFocus={(e) => e.target.style.borderColor = palette.accent}
+                    onBlur={(e) => e.target.style.borderColor = palette.border}
+                  />
+                </div>
+                {unsent > 0 && (
+                  <button
+                    onClick={() => liveDispatch({ type: "SEND_ALL_REMINDERS" })}
+                    style={{
+                      padding: "9px 20px", borderRadius: 10, border: "none",
+                      background: palette.accent, color: "#fff",
+                      fontSize: 13, fontWeight: 600, cursor: "pointer",
+                      fontFamily: "'Open Sans', sans-serif",
+                      boxShadow: `0 2px 8px ${palette.accent}40`,
+                      transition: "transform 0.1s",
+                    }}
+                    onMouseDown={(e) => e.target.style.transform = "scale(0.97)"}
+                    onMouseUp={(e) => e.target.style.transform = "scale(1)"}
+                  >
+                    Send All ({unsent})
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Reservation List */}
+            <div>
+              {filtered.length === 0 ? (
+                <div style={{
+                  textAlign: "center", padding: 60, color: palette.muted,
+                  fontFamily: "'Open Sans', sans-serif", fontSize: 14,
+                }}>
+                  No reservations match your filters.
+                </div>
+              ) : (
+                <>
+                  {/* Select All Header */}
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: 12,
+                    padding: "10px 20px 6px", marginBottom: 4,
+                  }}>
+                    <div
+                      onClick={() => {
+                        const filteredIds = filtered.map((r) => r.id);
+                        const allSelected = filteredIds.every((id) => state.selected.has(id));
+                        if (allSelected) dispatch({ type: "DESELECT_ALL" });
+                        else dispatch({ type: "SELECT_ALL_FILTERED", payload: filteredIds });
+                      }}
+                      style={{
+                        width: 22, height: 22, borderRadius: 6, flexShrink: 0,
+                        border: `2px solid ${filtered.length > 0 && filtered.every((r) => state.selected.has(r.id)) ? palette.accent : palette.border}`,
+                        background: filtered.length > 0 && filtered.every((r) => state.selected.has(r.id)) ? palette.accent
+                          : filtered.some((r) => state.selected.has(r.id)) ? palette.accentLight : "transparent",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        cursor: "pointer", transition: "all 0.15s",
+                      }}
+                    >
+                      {filtered.length > 0 && filtered.every((r) => state.selected.has(r.id)) && (
+                        <span style={{ color: "#fff", fontSize: 13, fontWeight: 700, lineHeight: 1 }}>✓</span>
+                      )}
+                      {filtered.some((r) => state.selected.has(r.id)) && !filtered.every((r) => state.selected.has(r.id)) && (
+                        <span style={{ color: palette.accent, fontSize: 15, fontWeight: 700, lineHeight: 1 }}>–</span>
+                      )}
+                    </div>
+                    <span style={{
+                      fontSize: 12, color: palette.muted, fontWeight: 500,
+                      fontFamily: "'Open Sans', sans-serif",
+                    }}>
+                      {state.selected.size > 0
+                        ? `${state.selected.size} selected`
+                        : `Select all (${filtered.length})`}
+                    </span>
+                    {state.selected.size > 0 && (
+                      <span
+                        onClick={() => dispatch({ type: "DESELECT_ALL" })}
+                        style={{
+                          fontSize: 12, color: palette.accent, cursor: "pointer",
+                          fontWeight: 500, fontFamily: "'Open Sans', sans-serif",
+                        }}
+                      >Clear</span>
+                    )}
+                  </div>
+
+                  {filtered.map((res) => (
+                    <ReservationRow
+                      key={res.id}
+                      res={res}
+                      isSelected={state.selectedId === res.id}
+                      isChecked={state.selected.has(res.id)}
+                      dispatch={liveDispatch}
+                    />
+                  ))}
+                </>
+              )}
+
+              {/* Bulk Action Bar */}
+              {state.selected.size > 0 && (
+                <BulkActionBar
+                  count={state.selected.size}
+                  dispatch={liveDispatch}
+                  reservations={state.reservations}
+                  selected={state.selected}
+                />
+              )}
+            </div>
+          </>
+        ) : state.view === "automation" ? (
+          <AutomationPanel reservations={state.reservations} />
+        ) : null}
+      </div>
+
+      {state.showToast && (
+        <Toast message={state.showToast} onDismiss={() => dispatch({ type: "DISMISS_TOAST" })} />
+      )}
+
+      {/* SMS Drawer */}
+      {state.smsDrawer && (() => {
+        const smsRes = state.reservations.find((r) => r.id === state.smsDrawer);
+        if (!smsRes) return null;
+        return (
+          <>
+            <SmsOverlay onClose={() => dispatch({ type: "CLOSE_SMS" })} />
+            <SmsDrawer reservation={smsRes} dispatch={liveDispatch} />
+          </>
+        );
+      })()}
+
+      {/* SMS Compose Modal */}
+      {state.smsCompose && (
+        <SmsComposeModal
+          compose={state.smsCompose}
+          reservations={state.reservations}
+          dispatch={dispatch}
+          onSend={liveDispatch}
+        />
+      )}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  React.createElement(ReservationDashboard)
+);
+  </script>
+</body>
+</html>
