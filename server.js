@@ -7,7 +7,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const twilio = require("twilio");
-const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -16,7 +15,7 @@ const PORT = process.env.PORT || 3001;
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
-const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID || "MGb0e243d1219dc595b59d1803ccf9a3cb"; // A2P 10DLC
+const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID; // A2P 10DLC
 const baseUrl = (process.env.BASE_URL || "").replace(/\/+$/, ""); // Strip trailing slashes
 const client = twilio(accountSid, authToken);
 
@@ -43,85 +42,9 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
 
-// ─── Password Protection ────────────────────────────────────────
-const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "FreedomAiTools";
-const activeSessions = new Set();
-
-function generateSessionId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
-// Login page HTML
-function loginPageHtml(error) {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Freedom Boat Club — Login</title>
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&family=Open+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #F0F4F8; min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: 'Open Sans', sans-serif; }
-    .login-card { background: #fff; border-radius: 20px; padding: 48px 40px; width: 90%; max-width: 400px; box-shadow: 0 4px 24px rgba(11,37,69,0.08); text-align: center; }
-    .logo { width: 80px; height: 80px; border-radius: 50%; margin: 0 auto 20px; }
-    h1 { font-family: 'Montserrat', sans-serif; color: #0B2545; font-size: 22px; margin-bottom: 6px; }
-    .subtitle { color: #6B7D94; font-size: 13px; margin-bottom: 28px; }
-    input { width: 100%; padding: 14px 18px; border: 2px solid #D1DAE6; border-radius: 12px; font-size: 15px; font-family: 'Open Sans', sans-serif; outline: none; transition: border-color 0.2s; margin-bottom: 16px; }
-    input:focus { border-color: #0B2545; }
-    button { width: 100%; padding: 14px; border: none; border-radius: 12px; background: #0B2545; color: #fff; font-size: 15px; font-weight: 600; font-family: 'Open Sans', sans-serif; cursor: pointer; transition: background 0.2s; }
-    button:hover { background: #163A6A; }
-    .error { color: #C41E3A; font-size: 13px; margin-bottom: 16px; font-weight: 600; }
-  </style>
-</head>
-<body>
-  <div class="login-card">
-    <h1>Reservation Confirmations</h1>
-    <div class="subtitle">Freedom Boat Club of NE Florida</div>
-    ${error ? '<div class="error">Incorrect password. Please try again.</div>' : ''}
-    <form method="POST" action="/login">
-      <input type="password" name="password" placeholder="Enter password" autofocus required />
-      <button type="submit">Sign In</button>
-    </form>
-  </div>
-</body>
-</html>`;
-}
-
-// Login routes
-app.post("/login", (req, res) => {
-  const { password } = req.body;
-  if (password === DASHBOARD_PASSWORD) {
-    const sessionId = generateSessionId();
-    activeSessions.add(sessionId);
-    res.cookie("fbc_session", sessionId, { httpOnly: true, maxAge: 24 * 60 * 60 * 1000 }); // 24 hours
-    res.redirect("/");
-  } else {
-    res.send(loginPageHtml(true));
-  }
-});
-
-app.get("/logout", (req, res) => {
-  const sid = parseCookie(req.headers.cookie || "", "fbc_session");
-  activeSessions.delete(sid);
-  res.clearCookie("fbc_session");
-  res.redirect("/");
-});
-
-function parseCookie(cookieStr, name) {
-  const match = cookieStr.match(new RegExp("(?:^|;\\s*)" + name + "=([^;]*)"));
-  return match ? match[1] : null;
-}
-
-function requireAuth(req, res, next) {
-  const sid = parseCookie(req.headers.cookie || "", "fbc_session");
-  if (sid && activeSessions.has(sid)) return next();
-  res.send(loginPageHtml(false));
-}
-
-// Root route — serve dashboard (protected)
-app.get("/", requireAuth, (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+// Root route
+app.get("/", (req, res) => {
+  res.json({ message: "Reservation SMS Server is running", docs: "/api/health" });
 });
 
 // ─── Dock Locations ─────────────────────────────────────────────
@@ -506,12 +429,9 @@ app.get("/api/health", (req, res) => {
 });
 
 // ─── Serve Dashboard ─────────────────────────────────────────────
-// Protect direct access to index.html
-app.get("/index.html", requireAuth, (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-app.use(express.static(path.join(__dirname, "public"), { index: false }));
-app.get("/dashboard", requireAuth, (req, res) => {
+const path = require("path");
+app.use(express.static(path.join(__dirname, "public")));
+app.get("/dashboard", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
