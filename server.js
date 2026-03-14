@@ -11,6 +11,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const session = require("express-session");
 const crypto = require("crypto");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -150,9 +151,9 @@ app.get("/api/session", (req, res) => {
 // --- Twilio Webhook Validation Middleware ---
 const twilioWebhookValidation = twilio.webhook({ validate: isProduction });
 
-// Root route
+// Root route — serve dashboard
 app.get("/", (req, res) => {
-  res.json({ message: "Reservation SMS Server is running" });
+  res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 // --- Dock Locations ---
@@ -528,7 +529,6 @@ app.get("/api/health", (req, res) => {
 });
 
 // --- Serve Dashboard ---
-const path = require("path");
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/dashboard", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
