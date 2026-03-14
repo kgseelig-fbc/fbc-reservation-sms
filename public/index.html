@@ -34,10 +34,36 @@ const DOCKS = [
 const api = {
   isLive: () => API_BASE.length > 0,
 
+  async login(password) {
+    const res = await fetch(`${API_BASE}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ password }),
+    });
+    return res.json();
+  },
+
+  async logout() {
+    const res = await fetch(`${API_BASE}/api/logout`, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async checkSession() {
+    const res = await fetch(`${API_BASE}/api/session`, {
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
   async sendSms(reservationId, customBody, dockId) {
     const res = await fetch(`${API_BASE}/api/sms/send/${reservationId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ ...(customBody ? { customBody } : {}), dock: dockId }),
     });
     return res.json();
@@ -47,6 +73,7 @@ const api = {
     const res = await fetch(`${API_BASE}/api/sms/send-bulk`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ ids, dock: dockId }),
     });
     return res.json();
@@ -56,13 +83,16 @@ const api = {
     const res = await fetch(`${API_BASE}/api/reservations/import?dock=${dockId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ data, dock: dockId }),
     });
     return res.json();
   },
 
   async fetchReservations(dockId) {
-    const res = await fetch(`${API_BASE}/api/reservations?dock=${dockId}`);
+    const res = await fetch(`${API_BASE}/api/reservations?dock=${dockId}`, {
+      credentials: "same-origin",
+    });
     return res.json();
   },
 
@@ -70,18 +100,23 @@ const api = {
     const res = await fetch(`${API_BASE}/api/reservations/${id}/status?dock=${dockId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ status, dock: dockId }),
     });
     return res.json();
   },
 
   async getSmsLog(id, dockId) {
-    const res = await fetch(`${API_BASE}/api/sms/log/${id}?dock=${dockId}`);
+    const res = await fetch(`${API_BASE}/api/sms/log/${id}?dock=${dockId}`, {
+      credentials: "same-origin",
+    });
     return res.json();
   },
 
   async healthCheck() {
-    const res = await fetch(`${API_BASE}/api/health`);
+    const res = await fetch(`${API_BASE}/api/health`, {
+      credentials: "same-origin",
+    });
     return res.json();
   },
 };
@@ -1592,7 +1627,7 @@ function BulkActionBar({ count, dispatch, reservations, selected }) {
 }
 
 // ─── Main App ────────────────────────────────────────────────────
-function ReservationDashboard() {
+function ReservationDashboard({ onLogout }) {
   const [state, dispatch] = useReducer(reducer, {
     reservations: [],
     filter: "all",
@@ -1884,6 +1919,17 @@ function ReservationDashboard() {
                 <span style={{ fontSize: 13 }}>⚓</span> {DOCKS.find((d) => d.id === state.currentDock)?.name || "Switch Dock"}
               </button>
             )}
+            <button
+              onClick={async () => { await api.logout(); if (onLogout) onLogout(); }}
+              style={{
+                padding: "10px 18px", borderRadius: 10,
+                border: `1.5px solid ${palette.border}`,
+                background: "transparent",
+                color: palette.muted,
+                fontSize: 12, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+              }}
+            >Logout</button>
           </div>
         </div>
 
@@ -2138,8 +2184,143 @@ function ReservationDashboard() {
   );
 }
 
+// --- Login Screen ---
+function LoginScreen({ onLogin }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      const result = await api.login(password);
+      if (result.success) {
+        onLogin();
+      } else {
+        setError(result.error || "Invalid password");
+      }
+    } catch (err) {
+      setError("Connection error. Please try again.");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
+      fontFamily: "'Montserrat', sans-serif",
+    }}>
+      <form onSubmit={handleSubmit} style={{
+        background: "rgba(255,255,255,0.07)",
+        backdropFilter: "blur(12px)",
+        borderRadius: 16,
+        padding: "48px 40px",
+        width: 380,
+        maxWidth: "90vw",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.3)",
+        border: "1px solid rgba(255,255,255,0.1)",
+        textAlign: "center",
+      }}>
+        <h1 style={{ color: "#fff", fontSize: 22, marginBottom: 8, fontWeight: 700 }}>
+          Reservation SMS Dashboard
+        </h1>
+        <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginBottom: 32 }}>
+          FBC NE Florida - Admin Access
+        </p>
+        {error && (
+          <div style={{
+            background: "rgba(239,68,68,0.15)",
+            border: "1px solid rgba(239,68,68,0.3)",
+            color: "#fca5a5",
+            borderRadius: 8,
+            padding: "10px 14px",
+            fontSize: 13,
+            marginBottom: 16,
+          }}>{error}</div>
+        )}
+        <input
+          type="password"
+          placeholder="Enter password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          autoFocus
+          style={{
+            width: "100%",
+            padding: "12px 16px",
+            borderRadius: 8,
+            border: "1px solid rgba(255,255,255,0.15)",
+            background: "rgba(255,255,255,0.08)",
+            color: "#fff",
+            fontSize: 15,
+            outline: "none",
+            marginBottom: 20,
+            boxSizing: "border-box",
+          }}
+        />
+        <button
+          type="submit"
+          disabled={loading || !password}
+          style={{
+            width: "100%",
+            padding: "12px 0",
+            borderRadius: 8,
+            border: "none",
+            background: loading ? "#555" : "linear-gradient(135deg, #0ea5e9, #2563eb)",
+            color: "#fff",
+            fontSize: 15,
+            fontWeight: 600,
+            cursor: loading ? "not-allowed" : "pointer",
+          }}
+        >
+          {loading ? "Signing in..." : "Sign In"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+// --- App Wrapper with Auth Gate ---
+function App() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    api.checkSession().then((data) => {
+      if (data.authenticated) setAuthenticated(true);
+      setChecking(false);
+    }).catch(() => setChecking(false));
+  }, []);
+
+  if (checking) {
+    return (
+      <div style={{
+        minHeight: "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
+        color: "rgba(255,255,255,0.5)",
+        fontFamily: "'Montserrat', sans-serif",
+        fontSize: 15,
+      }}>Loading...</div>
+    );
+  }
+
+  if (!authenticated) {
+    return <LoginScreen onLogin={() => setAuthenticated(true)} />;
+  }
+
+  return <ReservationDashboard onLogout={() => setAuthenticated(false)} />;
+}
+
 ReactDOM.createRoot(document.getElementById("root")).render(
-  React.createElement(ReservationDashboard)
+  React.createElement(App)
 );
   </script>
 </body>
