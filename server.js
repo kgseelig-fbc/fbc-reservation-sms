@@ -526,7 +526,7 @@ app.get("/api/sms/log/:id", requireAuth, (req, res) => {
 
 // --- Health Check (NOT protected) ---
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", twilioConfigured: !!(accountSid && authToken && twilioPhone) });
 });
 
 // --- Serve Dashboard ---
