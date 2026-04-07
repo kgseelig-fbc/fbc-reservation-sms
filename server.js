@@ -452,8 +452,8 @@ function parseReply(inboundText, reservation, dock) {
   return responseText;
 }
 
-// POST /api/sms/simulate -- simulate an inbound reply from the dashboard (protected)
-app.post("/api/sms/simulate", requireAuth, (req, res) => {
+// POST /api/sms/simulate -- send a real SMS reply via Twilio from the dashboard (protected)
+app.post("/api/sms/simulate", requireAuth, async (req, res) => {
   const { id, reply, dock: dockId } = req.body;
   if (!dockId || !getDock(dockId)) {
     return res.status(400).json({ error: "Invalid or missing dock parameter" });
@@ -465,8 +465,41 @@ app.post("/api/sms/simulate", requireAuth, (req, res) => {
   const reservation = dock.reservations.find((r) => r.id === id);
   if (!reservation) return res.status(404).json({ error: "Reservation not found" });
 
-  const responseText = parseReply(reply, reservation, dock);
-  res.json({ success: true, response: responseText, status: reservation.status });
+  if (!reservation.phone) {
+    return res.status(400).json({ error: "No phone number on file for this reservation" });
+  }
+
+  // Log the admin's outbound message
+  if (!dock.smsLogs[id]) dock.smsLogs[id] = [];
+  dock.smsLogs[id].push({
+    from: "system",
+    text: reply,
+    time: new Date().toISOString(),
+  });
+
+  // Send via Twilio
+  try {
+    const toPhone = normalizePhone(reservation.phone);
+    if (!toPhone || toPhone.length < 10) {
+      return res.status(400).json({ error: "Invalid phone number format" });
+    }
+    const message = await client.messages.create({
+      body: reply,
+      ...(messagingServiceSid ? { messagingServiceSid } : { from: twilioPhone }),
+      to: toPhone,
+      statusCallback: `${baseUrl}/api/sms/status`,
+    });
+
+    // Update log entry with Twilio SID
+    const lastLog = dock.smsLogs[id][dock.smsLogs[id].length - 1];
+    lastLog.twilioSid = message.sid;
+    lastLog.twilioStatus = message.status;
+
+    res.json({ success: true, messageSid: message.sid });
+  } catch (err) {
+    console.error("Twilio send error (chat):", err.message);
+    res.status(500).json({ error: `Failed to send: ${err.message}` });
+  }
 });
 
 // POST /api/sms/incoming -- Twilio sends inbound messages here

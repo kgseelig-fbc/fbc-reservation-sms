@@ -1128,7 +1128,7 @@ function SmsDrawer({ reservation, dispatch }) {
           display: "flex", gap: 6, flexWrap: "wrap", flexShrink: 0,
         }}>
           <div style={{ fontSize: 10, color: palette.muted, fontFamily: "'Open Sans', sans-serif", width: "100%", marginBottom: 2 }}>
-            Simulate member reply:
+            Quick replies:
           </div>
           {["CONFIRM", "CANCEL", "TIME 7:30 PM", "TIME 6:00 PM"].map((chip) => (
             <button
@@ -1158,7 +1158,7 @@ function SmsDrawer({ reservation, dispatch }) {
         }}>
           <input
             type="text"
-            placeholder="Type a member reply to simulate..."
+            placeholder="Type a message to send via SMS..."
             value={replyText}
             onChange={(e) => setReplyText(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSend()}
