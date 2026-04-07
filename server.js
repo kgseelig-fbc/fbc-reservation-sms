@@ -330,7 +330,7 @@ app.post("/api/sms/send/:id", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Twilio send error:", err.message);
-    res.status(500).json({ error: "Failed to send SMS", details: err.message });
+    res.status(500).json({ error: `Failed to send SMS: ${err.message}` });
   }
 });
 
