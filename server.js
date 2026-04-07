@@ -390,6 +390,85 @@ app.post("/api/sms/send-bulk", requireAuth, async (req, res) => {
 
 // --- Twilio Webhooks (validated, NOT auth-protected) ---
 
+// --- Shared reply parsing logic (used by both Twilio webhook and simulate endpoint) ---
+function parseReply(inboundText, reservation, dock) {
+  const id = reservation.id;
+  if (!dock.smsLogs[id]) dock.smsLogs[id] = [];
+
+  // Log inbound
+  dock.smsLogs[id].push({
+    from: "member",
+    text: inboundText,
+    time: new Date().toISOString(),
+  });
+
+  const replyLower = inboundText.toLowerCase().replace(/[^a-z0-9\s:]/g, "").trim();
+  let responseText;
+
+  const confirmPatterns = /^(confirm|confirmed|yes|yep|yeah|yea|yup|y|c|ok|okay|sure|sounds good|good|great|absolutely|perfect|see you there|will be there|we will be there|ill be there|looking forward|affirmative)$/;
+  const confirmLoose = /(confirm|yes|yep|yeah|yup|sounds good|okay|ok sure|absolutely|perfect|see you|will be there|looking forward|count me in|im in|we're in|all good|good to go)/;
+  const cancelPatterns = /^(cancel|cancelled|no|nope|nah|n|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|remove|pass)$/;
+  const cancelLoose = /(cancel|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|need to cancel|want to cancel|have to cancel|please cancel)/;
+  const timeMatch = replyLower.match(
+    /(?:time|change.*time|move.*to|reschedule.*to|change.*to|switch.*to|make it|new time)?\s*(\d{1,2}):?(\d{2})?\s*(am|pm)/i
+  );
+
+  if (confirmPatterns.test(replyLower) || confirmLoose.test(replyLower)) {
+    reservation.status = "confirmed";
+    responseText = "Thank you! Your reservation is confirmed. We look forward to seeing you!";
+  }
+  else if (cancelPatterns.test(replyLower) || cancelLoose.test(replyLower)) {
+    reservation.status = "cancelled";
+    responseText = "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
+  }
+  else if (timeMatch) {
+    let h = parseInt(timeMatch[1]);
+    const m = parseInt(timeMatch[2] || "0");
+    const ampm = timeMatch[3];
+    if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
+    if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
+    const dateObj = new Date(reservation.date);
+    if (!reservation.originalTime) reservation.originalTime = reservation.date;
+    dateObj.setHours(h, m, 0, 0);
+    reservation.date = dateObj.toISOString();
+    reservation.timeUpdated = true;
+    const newTimeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    responseText = `Got it! Your arrival time has been updated to ${newTimeStr}. Just reply YES to confirm your reservation.`;
+  } else {
+    responseText =
+      "Sorry, I didn't quite catch that. You can reply:\n" +
+      "• YES to confirm\n" +
+      "• CANCEL to cancel\n" +
+      "• A new time like \"7:30 AM\" to change your arrival";
+  }
+
+  // Log outbound reply
+  dock.smsLogs[id].push({
+    from: "system",
+    text: responseText,
+    time: new Date().toISOString(),
+  });
+
+  return responseText;
+}
+
+// POST /api/sms/simulate -- simulate an inbound reply from the dashboard (protected)
+app.post("/api/sms/simulate", requireAuth, (req, res) => {
+  const { id, reply, dock: dockId } = req.body;
+  if (!dockId || !getDock(dockId)) {
+    return res.status(400).json({ error: "Invalid or missing dock parameter" });
+  }
+  if (!reply || !id) {
+    return res.status(400).json({ error: "Missing id or reply" });
+  }
+  const dock = getDock(dockId);
+  const reservation = dock.reservations.find((r) => r.id === id);
+  if (!reservation) return res.status(404).json({ error: "Reservation not found" });
+
+  const responseText = parseReply(reply, reservation, dock);
+  res.json({ success: true, response: responseText, status: reservation.status });
+});
+
 // POST /api/sms/incoming -- Twilio sends inbound messages here
 // Configure this URL in your Twilio phone number settings under
 // "A MESSAGE COMES IN" -> Webhook -> POST -> https://yourdomain.com/api/sms/incoming
@@ -410,77 +489,8 @@ app.post("/api/sms/incoming", twilioWebhookValidation, (req, res) => {
 
   const { reservation, dockId } = found;
   const dock = getDock(dockId);
-  const id = reservation.id;
-  if (!dock.smsLogs[id]) dock.smsLogs[id] = [];
 
-  // Log inbound
-  dock.smsLogs[id].push({
-    from: "member",
-    text: inboundText,
-    time: new Date().toISOString(),
-    twilioFrom: From,
-  });
-
-  const replyLower = inboundText.toLowerCase().replace(/[^a-z0-9\s:]/g, "").trim();
-  let responseText;
-
-  // -- Parse CONFIRM (natural language) --
-  const confirmPatterns = /^(confirm|confirmed|yes|yep|yeah|yea|yup|y|c|ok|okay|sure|sounds good|good|great|absolutely|perfect|see you there|will be there|we will be there|ill be there|looking forward|affirmative)$/;
-  const confirmLoose = /(confirm|yes|yep|yeah|yup|sounds good|okay|ok sure|absolutely|perfect|see you|will be there|looking forward|count me in|im in|we're in|all good|good to go)/;
-
-  // -- Parse CANCEL (natural language) --
-  const cancelPatterns = /^(cancel|cancelled|no|nope|nah|n|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|remove|pass)$/;
-  const cancelLoose = /(cancel|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|need to cancel|want to cancel|have to cancel|please cancel)/;
-
-  // -- Parse TIME change --
-  const timeMatch = replyLower.match(
-    /(?:time|change.*time|move.*to|reschedule.*to|change.*to|switch.*to|make it|new time)?\s*(\d{1,2}):?(\d{2})?\s*(am|pm)/i
-  );
-
-  if (confirmPatterns.test(replyLower) || confirmLoose.test(replyLower)) {
-    reservation.status = "confirmed";
-    responseText =
-      "Thank you! Your reservation is confirmed. We look forward to seeing you!";
-  }
-  else if (cancelPatterns.test(replyLower) || cancelLoose.test(replyLower)) {
-    reservation.status = "cancelled";
-    responseText =
-      "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
-  }
-  else if (timeMatch) {
-    let h = parseInt(timeMatch[1]);
-    const m = parseInt(timeMatch[2] || "0");
-    const ampm = timeMatch[3];
-    if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
-    if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
-
-    const dateObj = new Date(reservation.date);
-    if (!reservation.originalTime) reservation.originalTime = reservation.date;
-    dateObj.setHours(h, m, 0, 0);
-    reservation.date = dateObj.toISOString();
-    reservation.timeUpdated = true;
-
-    const newTimeStr = dateObj.toLocaleTimeString("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-    });
-    responseText =
-      `Got it! Your arrival time has been updated to ${newTimeStr}. ` +
-      `Just reply YES to confirm your reservation.`;
-  } else {
-    responseText =
-      "Sorry, I didn't quite catch that. You can reply:\n" +
-      "• YES to confirm\n" +
-      "• CANCEL to cancel\n" +
-      "• A new time like \"7:30 AM\" to change your arrival";
-  }
-
-  // Log outbound reply
-  dock.smsLogs[id].push({
-    from: "system",
-    text: responseText,
-    time: new Date().toISOString(),
-  });
+  const responseText = parseReply(inboundText, reservation, dock);
 
   // Respond via TwiML
   const twiml = new twilio.twiml.MessagingResponse();

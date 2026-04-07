@@ -108,6 +108,16 @@ const api = {
     return res.json();
   },
 
+  async simulateReply(id, reply, dockId) {
+    const res = await fetch(`${API_BASE}/api/sms/simulate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ id, reply, dock: dockId }),
+    });
+    return res.json();
+  },
+
   async getSmsLog(id, dockId) {
     const res = await fetch(`${API_BASE}/api/sms/log/${id}?dock=${dockId}`, {
       credentials: "same-origin",
@@ -1785,6 +1795,15 @@ function ReservationDashboard({ onLogout }) {
         try {
           await api.updateStatus(action.payload.id, action.payload.status, state.currentDock);
           dispatch(action);
+        } catch {
+          dispatch(action); // fallback to local
+        }
+        break;
+      }
+      case "SIMULATE_REPLY": {
+        try {
+          await api.simulateReply(action.payload.id, action.payload.reply, state.currentDock);
+          await refreshFromServer();
         } catch {
           dispatch(action); // fallback to local
         }
