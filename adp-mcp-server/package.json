@@ -1,0 +1,13 @@
+{
+  "name": "adp-run-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for ADP Run - payroll, HR, time & attendance",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
