@@ -49,8 +49,8 @@ function last10(phone) {
 app.use(helmet({ contentSecurityPolicy: false }));
 
 const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 500,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please try again later" },
@@ -342,10 +342,7 @@ function buildSmsBody(reservation) {
     `Hi ${name.split(" ")[0]}! ` +
     `This is a reminder about your upcoming ${reservation.service || "reservation"} ` +
     `on ${dateStr} at ${timeStr} for ${reservation.guests || 1} guest(s).\n\n` +
-    `Reply:\n` +
-    `• CONFIRM to confirm\n` +
-    `• CANCEL to cancel\n` +
-    `• TIME [new time] to update arrival (e.g. TIME 7:30 PM)`
+    `Can you make it? Just reply YES to confirm, CANCEL to cancel, or send a new time (e.g. 7:30 AM) if you need to change your arrival.`
   );
 }
 
@@ -394,8 +391,8 @@ app.post("/api/sms/send/:id", requireAuth, async (req, res) => {
     const { rows: updated } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
     res.json({ success: true, messageSid: message.sid, reservation: rowToReservation(updated[0]) });
   } catch (err) {
-    console.error("Send SMS error:", err.message);
-    res.status(500).json({ error: "Failed to send SMS", details: err.message });
+    console.error("Twilio send error:", err.message);
+    res.status(500).json({ error: `Failed to send SMS: ${err.message}`, details: err.message });
   }
 });
 
@@ -449,7 +446,98 @@ app.post("/api/sms/send-bulk", requireAuth, async (req, res) => {
 
 // --- Twilio Webhooks ---
 
-// POST /api/sms/incoming
+// --- Natural-language reply parsing ---
+// Given an inbound text and (optionally) the matched reservation row, updates
+// the reservation in Postgres and returns the canned response string. All
+// message persistence happens in the caller.
+async function parseAndApplyReply(inboundText, reservation) {
+  const replyLower = inboundText.toLowerCase().replace(/[^a-z0-9\s:]/g, "").trim();
+
+  const confirmPatterns = /^(confirm|confirmed|yes|yep|yeah|yea|yup|y|c|ok|okay|sure|sounds good|good|great|absolutely|perfect|see you there|will be there|we will be there|ill be there|looking forward|affirmative)$/;
+  const confirmLoose = /(confirm|yes|yep|yeah|yup|sounds good|okay|ok sure|absolutely|perfect|see you|will be there|looking forward|count me in|im in|we're in|all good|good to go)/;
+  const cancelPatterns = /^(cancel|cancelled|no|nope|nah|n|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|remove|pass)$/;
+  const cancelLoose = /(cancel|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|need to cancel|want to cancel|have to cancel|please cancel)/;
+  const timeMatch = replyLower.match(
+    /(?:time|change.*time|move.*to|reschedule.*to|change.*to|switch.*to|make it|new time)?\s*(\d{1,2}):?(\d{2})?\s*(am|pm)/i
+  );
+
+  if (!reservation) {
+    return "Sorry, we couldn't find a reservation associated with this number. Please call us directly for assistance.";
+  }
+
+  if (confirmPatterns.test(replyLower) || confirmLoose.test(replyLower)) {
+    await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
+    return "Thank you! Your reservation is confirmed. We look forward to seeing you!";
+  }
+
+  if (cancelPatterns.test(replyLower) || cancelLoose.test(replyLower)) {
+    await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
+    return "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
+  }
+
+  if (timeMatch) {
+    let h = parseInt(timeMatch[1]);
+    const m = parseInt(timeMatch[2] || "0");
+    const ampm = timeMatch[3];
+    if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
+    if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
+
+    const dateObj = new Date(reservation.reservation_date);
+    const originalTime = reservation.original_time || reservation.reservation_date;
+    dateObj.setHours(h, m, 0, 0);
+    await db.query(
+      `UPDATE reservations
+       SET reservation_date = $1, time_updated = TRUE,
+           original_time = COALESCE(original_time, $2)
+       WHERE id = $3`,
+      [dateObj.toISOString(), originalTime, reservation.id]
+    );
+    const newTimeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    return `Got it! Your arrival time has been updated to ${newTimeStr}. Just reply YES to confirm your reservation.`;
+  }
+
+  return (
+    "Sorry, I didn't quite catch that. You can reply:\n" +
+    "• YES to confirm\n" +
+    "• CANCEL to cancel\n" +
+    "• A new time like \"7:30 AM\" to change your arrival"
+  );
+}
+
+// POST /api/sms/simulate — admin-composed SMS sent via Twilio from the dashboard chat box
+app.post("/api/sms/simulate", requireAuth, async (req, res) => {
+  const { id, reply } = req.body;
+  if (!id || !reply) return res.status(400).json({ error: "Missing id or reply" });
+
+  try {
+    const { rows } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
+    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
+    const reservation = rows[0];
+    if (!reservation.phone) return res.status(400).json({ error: "No phone number on file for this reservation" });
+
+    const toPhone = normalizePhone(reservation.phone);
+    if (!toPhone || toPhone.length < 10) return res.status(400).json({ error: "Invalid phone number format" });
+
+    const message = await client.messages.create({
+      body: reply,
+      ...(messagingServiceSid ? { messagingServiceSid } : { from: twilioPhone }),
+      to: toPhone,
+      statusCallback: baseUrl ? `${baseUrl}/api/sms/status` : undefined,
+    });
+
+    await db.query(
+      `INSERT INTO messages (phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status)
+       VALUES ($1, $2, $3, 'out', $4, $5, $6)`,
+      [toPhone, reservation.id, reservation.dock_id, reply, message.sid, message.status]
+    );
+    res.json({ success: true, messageSid: message.sid });
+  } catch (err) {
+    console.error("Twilio send error (chat):", err.message);
+    res.status(500).json({ error: `Failed to send: ${err.message}` });
+  }
+});
+
+// POST /api/sms/incoming — Twilio inbound webhook
 app.post("/api/sms/incoming", twilioWebhookValidation, async (req, res) => {
   const { From, Body } = req.body;
   const inboundText = (Body || "").trim();
@@ -459,8 +547,8 @@ app.post("/api/sms/incoming", twilioWebhookValidation, async (req, res) => {
   try {
     const reservation = await findReservationByPhone(From);
 
-    // Log inbound message (always, even if no reservation found — so replies
-    // from a stale phone still appear in the conversation history)
+    // Log inbound first — even without a matching reservation, so a stale
+    // reply still shows up in the per-phone conversation history.
     await db.query(
       `INSERT INTO messages (phone, reservation_id, dock_id, direction, body)
        VALUES ($1, $2, $3, 'in', $4)`,
@@ -470,52 +558,8 @@ app.post("/api/sms/incoming", twilioWebhookValidation, async (req, res) => {
       await upsertMember(c, normalizedFrom, reservation ? reservation.name : null, null);
     });
 
-    if (!reservation) {
-      responseText =
-        "Sorry, we couldn't find a reservation associated with this number. " +
-        "Please call us directly for assistance.";
-    } else {
-      const replyLower = inboundText.toLowerCase();
-      if (replyLower === "confirm" || replyLower === "yes" || replyLower === "c") {
-        await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
-        responseText = "Thank you! Your reservation is confirmed. We look forward to seeing you!";
-      } else if (replyLower === "cancel" || replyLower === "no") {
-        await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
-        responseText = "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
-      } else {
-        const timeMatch = replyLower.match(/^time\s+(\d{1,2}):?(\d{2})?\s*(am|pm)?$/i);
-        if (timeMatch) {
-          let h = parseInt(timeMatch[1]);
-          const m = parseInt(timeMatch[2] || "0");
-          const ampm = timeMatch[3];
-          if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
-          if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
+    responseText = await parseAndApplyReply(inboundText, reservation);
 
-          const dateObj = new Date(reservation.reservation_date);
-          const originalTime = reservation.original_time || reservation.reservation_date;
-          dateObj.setHours(h, m, 0, 0);
-          await db.query(
-            `UPDATE reservations
-             SET reservation_date = $1, time_updated = TRUE,
-                 original_time = COALESCE(original_time, $2)
-             WHERE id = $3`,
-            [dateObj.toISOString(), originalTime, reservation.id]
-          );
-          const newTimeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-          responseText =
-            `Got it! Your arrival time has been updated to ${newTimeStr}. ` +
-            `Please reply CONFIRM to finalize your reservation.`;
-        } else {
-          responseText =
-            "Sorry, I didn't understand that. Please reply:\n" +
-            "• CONFIRM to confirm\n" +
-            "• CANCEL to cancel\n" +
-            "• TIME [new time] to change arrival (e.g. TIME 7:30 PM)";
-        }
-      }
-    }
-
-    // Log the outbound reply
     await db.query(
       `INSERT INTO messages (phone, reservation_id, dock_id, direction, body)
        VALUES ($1, $2, $3, 'out', $4)`,
