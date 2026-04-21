@@ -115,6 +115,20 @@ const api = {
     return res.json();
   },
 
+  async listConversations() {
+    const res = await fetch(`${API_BASE}/api/conversations`, {
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async getConversation(phone) {
+    const res = await fetch(`${API_BASE}/api/conversations/${encodeURIComponent(phone)}`, {
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
   async healthCheck() {
     const res = await fetch(`${API_BASE}/api/health`, {
       credentials: "same-origin",
@@ -268,6 +282,10 @@ function reducer(state, action) {
       return { ...state, smsDrawer: action.payload };
     case "CLOSE_SMS":
       return { ...state, smsDrawer: null };
+    case "OPEN_CONVERSATION":
+      return { ...state, conversationPhone: action.payload };
+    case "CLOSE_CONVERSATION":
+      return { ...state, conversationPhone: null };
     case "OPEN_COMPOSE":
       return { ...state, smsCompose: action.payload };
     case "CLOSE_COMPOSE":
@@ -1628,6 +1646,309 @@ function BulkActionBar({ count, dispatch, reservations, selected }) {
   );
 }
 
+// ─── Conversations Panel ─────────────────────────────────────────
+function ConversationsPanel({ onOpen }) {
+  const [conversations, setConversations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const data = await api.listConversations();
+        if (active) {
+          setConversations(data.conversations || []);
+          setError("");
+        }
+      } catch {
+        if (active) setError("Failed to load conversations");
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    load();
+    const interval = setInterval(load, 10000);
+    return () => { active = false; clearInterval(interval); };
+  }, []);
+
+  const dockName = (id) => (DOCKS.find((d) => d.id === id) || {}).name || id || "—";
+
+  const filtered = conversations.filter((c) => {
+    if (!search) return true;
+    const s = search.toLowerCase();
+    return (c.phone || "").toLowerCase().includes(s) ||
+           (c.name || "").toLowerCase().includes(s) ||
+           (c.last_message_body || "").toLowerCase().includes(s);
+  });
+
+  return (
+    <div>
+      <div style={{
+        display: "flex", gap: 12, alignItems: "center",
+        marginBottom: 20, flexWrap: "wrap",
+      }}>
+        <input
+          type="text"
+          placeholder="Search by name, phone, or message..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          style={{
+            flex: 1, minWidth: 240, padding: "10px 16px",
+            borderRadius: 10, border: `1.5px solid ${palette.border}`,
+            background: palette.card, fontSize: 13,
+            fontFamily: "'Open Sans', sans-serif", color: palette.dark,
+            outline: "none",
+          }}
+        />
+        <div style={{ color: palette.muted, fontSize: 12, fontFamily: "'Open Sans', sans-serif" }}>
+          {filtered.length} conversation{filtered.length === 1 ? "" : "s"}
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ padding: 40, textAlign: "center", color: palette.muted }}>Loading...</div>
+      ) : error ? (
+        <div style={{ padding: 20, color: palette.red }}>{error}</div>
+      ) : filtered.length === 0 ? (
+        <div style={{
+          padding: "60px 20px", textAlign: "center", color: palette.muted,
+          background: palette.card, borderRadius: 12,
+          border: `1.5px solid ${palette.border}`,
+        }}>
+          <div style={{ fontSize: 36, marginBottom: 10, opacity: 0.4 }}>💬</div>
+          No conversations yet. Send a message to start one.
+        </div>
+      ) : (
+        <div style={{
+          background: palette.card, borderRadius: 12,
+          border: `1.5px solid ${palette.border}`, overflow: "hidden",
+        }}>
+          {filtered.map((c, idx) => {
+            const dt = c.last_message_at ? new Date(c.last_message_at) : null;
+            const dateLabel = dt
+              ? dt.toLocaleDateString("en-US", { month: "short", day: "numeric" }) +
+                " · " +
+                dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+              : "";
+            const preview = (c.last_message_body || "").replace(/\s+/g, " ").slice(0, 120);
+            const inbound = c.last_direction === "in";
+            return (
+              <div
+                key={c.phone}
+                onClick={() => onOpen(c.phone)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 14,
+                  padding: "14px 18px", cursor: "pointer",
+                  borderBottom: idx === filtered.length - 1 ? "none" : `1px solid ${palette.border}`,
+                  transition: "background 0.12s",
+                }}
+                onMouseEnter={(e) => e.currentTarget.style.background = "#F5F8FB"}
+                onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+              >
+                <div style={{
+                  width: 42, height: 42, borderRadius: "50%",
+                  background: `linear-gradient(135deg, ${palette.accent}20, ${palette.accent}40)`,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 13, fontWeight: 700, color: palette.accent,
+                  fontFamily: "'Montserrat', sans-serif", flexShrink: 0,
+                }}>
+                  {(c.name || "?").split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase()}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{
+                    display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 3,
+                  }}>
+                    <div style={{
+                      fontWeight: 600, fontSize: 14, color: palette.dark,
+                      fontFamily: "'Open Sans', sans-serif",
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    }}>
+                      {c.name || c.phone}
+                    </div>
+                    <div style={{ fontSize: 11, color: palette.muted, flexShrink: 0 }}>
+                      {dateLabel}
+                    </div>
+                  </div>
+                  <div style={{
+                    fontSize: 12, color: palette.muted,
+                    fontFamily: "'Open Sans', sans-serif",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>
+                    <span style={{ color: inbound ? palette.blue : palette.muted, fontWeight: 600 }}>
+                      {inbound ? "→ " : "← "}
+                    </span>
+                    {preview}
+                  </div>
+                  <div style={{
+                    fontSize: 10, color: palette.muted, marginTop: 3,
+                    fontFamily: "'Open Sans', sans-serif",
+                  }}>
+                    {c.phone} · {c.message_count} message{c.message_count === 1 ? "" : "s"} · {dockName(c.last_dock_id)}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Conversation Drawer (phone-keyed, full iPhone-style thread) ─
+function ConversationDrawer({ phone, onClose }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const result = await api.getConversation(phone);
+        if (active) setData(result);
+      } catch {
+        if (active) setError("Failed to load conversation");
+      }
+    };
+    load();
+    const interval = setInterval(load, 8000);
+    return () => { active = false; clearInterval(interval); };
+  }, [phone]);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [data && data.messages && data.messages.length]);
+
+  const dockName = (id) => (DOCKS.find((d) => d.id === id) || {}).name || id || "";
+
+  const name = data && (data.member?.name || data.reservations[0]?.name) || phone;
+  const messages = (data && data.messages) || [];
+  const reservations = (data && data.reservations) || [];
+
+  return (
+    <div style={{
+      position: "fixed", top: 0, right: 0, bottom: 0, width: "100%", maxWidth: 460,
+      background: palette.card, zIndex: 1000, display: "flex", flexDirection: "column",
+      boxShadow: "-8px 0 40px rgba(0,0,0,0.15)",
+      animation: "slideIn 0.25s ease-out",
+    }}>
+      <style>{`@keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }`}</style>
+
+      <div style={{
+        padding: "18px 20px", borderBottom: `1px solid ${palette.border}`,
+        display: "flex", alignItems: "center", gap: 12, flexShrink: 0,
+      }}>
+        <button
+          onClick={onClose}
+          style={{
+            background: "none", border: "none", fontSize: 22, cursor: "pointer",
+            color: palette.muted, padding: 0, lineHeight: 1,
+          }}
+        >←</button>
+        <div style={{
+          width: 38, height: 38, borderRadius: "50%",
+          background: `linear-gradient(135deg, ${palette.accent}20, ${palette.accent}40)`,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 14, fontWeight: 600, color: palette.accent,
+          fontFamily: "'Montserrat', sans-serif", flexShrink: 0,
+        }}>
+          {(name || "?").split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase()}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, color: palette.dark, fontFamily: "'Open Sans', sans-serif" }}>{name}</div>
+          <div style={{ fontSize: 11, color: palette.muted, fontFamily: "'Open Sans', sans-serif" }}>
+            {phone} · {reservations.length} reservation{reservations.length === 1 ? "" : "s"}
+          </div>
+        </div>
+      </div>
+
+      <div ref={scrollRef} style={{
+        flex: 1, overflowY: "auto", padding: "20px 16px",
+        display: "flex", flexDirection: "column", gap: 10,
+        background: "#E8EDF4",
+      }}>
+        {error && <div style={{ color: palette.red, textAlign: "center" }}>{error}</div>}
+        {messages.length === 0 && !error && (
+          <div style={{ textAlign: "center", color: palette.muted, padding: 40 }}>
+            No messages yet.
+          </div>
+        )}
+        {messages.map((msg, i) => {
+          const prev = i > 0 ? messages[i - 1] : null;
+          const showDate = !prev ||
+            new Date(msg.time).toDateString() !== new Date(prev.time).toDateString();
+          const t = new Date(msg.time);
+          return (
+            <React.Fragment key={i}>
+              {showDate && (
+                <div style={{
+                  textAlign: "center", fontSize: 10, color: palette.muted,
+                  margin: "8px 0 4px", fontFamily: "'Open Sans', sans-serif",
+                }}>
+                  {t.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" })}
+                </div>
+              )}
+              <div style={{
+                display: "flex",
+                justifyContent: msg.from === "system" ? "flex-start" : "flex-end",
+              }}>
+                <div style={{
+                  maxWidth: "80%", padding: "10px 14px", borderRadius: 16,
+                  borderBottomLeftRadius: msg.from === "system" ? 4 : 16,
+                  borderBottomRightRadius: msg.from === "member" ? 4 : 16,
+                  background: msg.from === "system" ? palette.card : palette.accent,
+                  color: msg.from === "system" ? palette.dark : "#fff",
+                  fontSize: 13, lineHeight: 1.6, fontFamily: "'Open Sans', sans-serif",
+                  boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
+                  whiteSpace: "pre-wrap",
+                }}>
+                  {msg.text}
+                  <div style={{
+                    fontSize: 10, marginTop: 4, textAlign: "right",
+                    color: msg.from === "system" ? palette.muted : "rgba(255,255,255,0.7)",
+                  }}>
+                    {t.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                    {msg.dockId ? ` · ${dockName(msg.dockId)}` : ""}
+                  </div>
+                </div>
+              </div>
+            </React.Fragment>
+          );
+        })}
+      </div>
+
+      {reservations.length > 0 && (
+        <div style={{
+          padding: "10px 16px", background: "#F5F8FB",
+          borderTop: `1px solid ${palette.border}`,
+          fontSize: 11, color: palette.muted, flexShrink: 0,
+          fontFamily: "'Open Sans', sans-serif",
+          maxHeight: 120, overflowY: "auto",
+        }}>
+          <div style={{ fontWeight: 600, marginBottom: 4, color: palette.dark }}>
+            Reservation history
+          </div>
+          {reservations.slice(0, 6).map((r) => {
+            const d = r.date ? new Date(r.date) : null;
+            return (
+              <div key={r.id} style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
+                <span>
+                  {d ? d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—"}
+                  {" · "}{dockName(r.dock)}
+                </span>
+                <span style={{ color: palette.dark }}>{r.status}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main App ────────────────────────────────────────────────────
 function ReservationDashboard({ onLogout }) {
   const [state, dispatch] = useReducer(reducer, {
@@ -1640,6 +1961,7 @@ function ReservationDashboard({ onLogout }) {
     smsCompose: null, // { id, body, mode: "single"|"bulk" }
     currentDock: null, // dock id
     view: "dock-select", // start at dock selection
+    conversationPhone: null, // phone of the conversation drawer (if open)
     showToast: null,
   });
 
@@ -1882,6 +2204,16 @@ function ReservationDashboard({ onLogout }) {
               }}
             >Reservations</button>
             <button
+              onClick={() => dispatch({ type: "SET_VIEW", payload: "conversations" })}
+              style={{
+                padding: "10px 22px", borderRadius: 10, border: "none",
+                background: state.view === "conversations" ? palette.dark : "transparent",
+                color: state.view === "conversations" ? "#fff" : palette.muted,
+                fontSize: 13, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+              }}
+            >Conversations</button>
+            <button
               onClick={() => dispatch({ type: "SET_VIEW", payload: "automation" })}
               style={{
                 padding: "10px 22px", borderRadius: 10, border: "none",
@@ -1993,6 +2325,8 @@ function ReservationDashboard({ onLogout }) {
               ))}
             </div>
           </div>
+        ) : state.view === "conversations" ? (
+          <ConversationsPanel onOpen={(phone) => dispatch({ type: "OPEN_CONVERSATION", payload: phone })} />
         ) : state.view === "upload" || (state.view === "reservations" && state.reservations.length === 0) ? (
           <UploadPanel dispatch={(action) => {
             liveDispatch(action);
@@ -2172,6 +2506,17 @@ function ReservationDashboard({ onLogout }) {
           </>
         );
       })()}
+
+      {/* Conversation Drawer (phone-keyed, cross-dock) */}
+      {state.conversationPhone && (
+        <>
+          <SmsOverlay onClose={() => dispatch({ type: "CLOSE_CONVERSATION" })} />
+          <ConversationDrawer
+            phone={state.conversationPhone}
+            onClose={() => dispatch({ type: "CLOSE_CONVERSATION" })}
+          />
+        </>
+      )}
 
       {/* SMS Compose Modal */}
       {state.smsCompose && (
