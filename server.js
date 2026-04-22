@@ -1,7 +1,6 @@
 // -----------------------------------------------------------------
-//  Reservation SMS Confirmation Server
-//  Express + Twilio integration for two-way SMS confirmations
-//  Postgres-backed: append-only reservations, phone-keyed conversations
+//  Reservation SMS Confirmation Server — Multi-Tenant
+//  Express + Twilio, Postgres-backed, row-level isolation by franchise_id.
 // -----------------------------------------------------------------
 
 require("dotenv").config();
@@ -11,6 +10,7 @@ const twilio = require("twilio");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const session = require("express-session");
+const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const path = require("path");
 const db = require("./db");
@@ -20,18 +20,7 @@ app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3001;
 const isProduction = process.env.NODE_ENV === "production";
 
-// --- Admin Password ---
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "fbc-admin-2024";
-
-// --- Twilio Client ---
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const twilioPhone = process.env.TWILIO_PHONE_NUMBER;
-const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-const baseUrl = (process.env.BASE_URL || "").replace(/\/+$/, "");
-const client = twilio(accountSid, authToken);
-
-// --- Phone Number Normalization (E.164) ---
+// --- Phone normalization ---
 function normalizePhone(phone) {
   if (!phone) return "";
   let digits = phone.replace(/\D/g, "");
@@ -40,16 +29,15 @@ function normalizePhone(phone) {
   if (phone.startsWith("+")) return phone.replace(/[^\d+]/g, "");
   return `+${digits}`;
 }
-
 function last10(phone) {
   return (phone || "").replace(/\D/g, "").slice(-10);
 }
 
-// --- Middleware ---
+// --- Security / middleware ---
 app.use(helmet({ contentSecurityPolicy: false }));
 
 const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 500,
   standardHeaders: true,
   legacyHeaders: false,
@@ -59,7 +47,7 @@ app.use(globalLimiter);
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many login attempts, please try again later" },
@@ -68,13 +56,9 @@ const loginLimiter = rateLimit({
 const allowedOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(",").map((s) => s.trim())
   : [];
-
 app.use(cors({
   origin: allowedOrigins.length > 0
-    ? (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) callback(null, true);
-        else callback(new Error("Not allowed by CORS"));
-      }
+    ? (origin, cb) => (!origin || allowedOrigins.includes(origin)) ? cb(null, true) : cb(new Error("Not allowed by CORS"))
     : false,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -97,86 +81,223 @@ app.use(session({
   },
 }));
 
-function requireAuth(req, res, next) {
-  if (req.session && req.session.authenticated) return next();
-  return res.status(401).json({ error: "Authentication required" });
+// --- Franchise / user helpers ---
+const franchiseCache = new Map(); // id -> franchise row
+const twilioClientCache = new Map(); // franchise id -> twilio client
+
+async function loadFranchise(id) {
+  if (!id) return null;
+  if (franchiseCache.has(id)) return franchiseCache.get(id);
+  const { rows } = await db.query(`SELECT * FROM franchises WHERE id = $1`, [id]);
+  if (rows.length === 0) return null;
+  franchiseCache.set(id, rows[0]);
+  return rows[0];
+}
+function invalidateFranchise(id) {
+  franchiseCache.delete(id);
+  twilioClientCache.delete(id);
 }
 
-// --- Auth ---
-app.post("/api/login", loginLimiter, (req, res) => {
-  const { password } = req.body;
-  if (!password) return res.status(400).json({ error: "Password is required" });
-  if (password === ADMIN_PASSWORD) {
-    req.session.authenticated = true;
-    req.session.loginTime = new Date().toISOString();
-    return res.json({ success: true });
+function getTwilioClient(franchise) {
+  if (!franchise || !franchise.twilio_account_sid || !franchise.twilio_auth_token) return null;
+  let client = twilioClientCache.get(franchise.id);
+  if (!client) {
+    client = twilio(franchise.twilio_account_sid, franchise.twilio_auth_token);
+    twilioClientCache.set(franchise.id, client);
   }
-  return res.status(401).json({ error: "Invalid password" });
+  return client;
+}
+
+async function findFranchiseByInboundTo(toNumber) {
+  const normalized = normalizePhone(toNumber);
+  const { rows } = await db.query(
+    `SELECT * FROM franchises WHERE twilio_phone_number = $1 LIMIT 1`,
+    [normalized]
+  );
+  return rows[0] || null;
+}
+
+// --- Auth middleware ---
+function requireAuth(req, res, next) {
+  if (!req.session || !req.session.userId) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
+  next();
+}
+
+// After auth. Ensures an active franchise is selected. Super-admins must pick
+// one before touching tenant-scoped routes (via /api/admin/switch-franchise).
+async function requireFranchiseContext(req, res, next) {
+  const activeId = req.session.activeFranchiseId;
+  if (!activeId) {
+    return res.status(409).json({ error: "No active franchise selected", needsFranchiseSelection: true });
+  }
+  const franchise = await loadFranchise(activeId);
+  if (!franchise) return res.status(404).json({ error: "Active franchise no longer exists" });
+  req.franchise = franchise;
+  req.franchiseId = franchise.id;
+  next();
+}
+
+function requireSuperAdmin(req, res, next) {
+  if (req.session.role !== "super_admin") return res.status(403).json({ error: "Super-admin only" });
+  next();
+}
+
+// --- Auth routes ---
+app.post("/api/login", loginLimiter, async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+
+  try {
+    const { rows } = await db.query(
+      `SELECT id, email, password_hash, role, franchise_id FROM users WHERE email = $1`,
+      [email.toLowerCase().trim()]
+    );
+    const user = rows[0];
+    const ok = user && await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: "Invalid email or password" });
+
+    req.session.userId = user.id;
+    req.session.email = user.email;
+    req.session.role = user.role;
+    req.session.franchiseId = user.franchise_id; // home franchise (null for super_admin)
+    req.session.activeFranchiseId = user.franchise_id; // super_admin picks one via /api/admin/switch-franchise
+
+    await db.query(`UPDATE users SET last_login = NOW() WHERE id = $1`, [user.id]);
+    res.json({
+      success: true,
+      user: { email: user.email, role: user.role, franchiseId: user.franchise_id },
+      needsFranchiseSelection: user.role === "super_admin",
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ error: "Login failed" });
+  }
 });
 
 app.post("/api/logout", (req, res) => {
   req.session.destroy((err) => {
     if (err) return res.status(500).json({ error: "Failed to logout" });
     res.clearCookie("fbc.rsms.sid");
-    return res.json({ success: true });
+    res.json({ success: true });
   });
 });
 
 app.get("/api/session", (req, res) => {
-  res.json({ authenticated: !!(req.session && req.session.authenticated) });
+  res.json({
+    authenticated: !!(req.session && req.session.userId),
+    email: req.session?.email || null,
+    role: req.session?.role || null,
+    needsFranchiseSelection: !!req.session?.userId && !req.session?.activeFranchiseId,
+  });
 });
 
-// --- Twilio Webhook Validation ---
-const twilioWebhookValidation = twilio.webhook({ validate: isProduction });
-
-// Root
-app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+// GET /api/me — current user, active franchise, dock list, branding
+app.get("/api/me", requireAuth, async (req, res) => {
+  try {
+    const activeId = req.session.activeFranchiseId;
+    let franchise = null;
+    let docks = [];
+    if (activeId) {
+      franchise = await loadFranchise(activeId);
+      if (franchise) {
+        const { rows } = await db.query(
+          `SELECT id, name, sort_order FROM docks WHERE franchise_id = $1 ORDER BY sort_order ASC, name ASC`,
+          [franchise.id]
+        );
+        docks = rows;
+      }
+    }
+    res.json({
+      user: { email: req.session.email, role: req.session.role, franchiseId: req.session.franchiseId },
+      franchise: franchise && {
+        id: franchise.id, slug: franchise.slug, name: franchise.name,
+        timezone: franchise.timezone, logoUrl: franchise.logo_url,
+        brandColor: franchise.brand_color,
+        twilioConfigured: !!(franchise.twilio_account_sid && franchise.twilio_auth_token),
+      },
+      docks,
+    });
+  } catch (err) {
+    console.error("/api/me error:", err);
+    res.status(500).json({ error: "Failed to load profile" });
+  }
 });
 
-// --- Dock Locations ---
-const DOCKS = [
-  { id: "jax-beach", name: "Jacksonville Beach" },
-  { id: "julington-east", name: "Julington Creek East" },
-  { id: "julington-west", name: "Julington Creek West" },
-  { id: "camachee-cove", name: "St. Augustine -- Camachee Cove" },
-  { id: "shipyard", name: "St. Augustine -- Shipyard" },
-];
-const DOCK_IDS = new Set(DOCKS.map((d) => d.id));
-
-app.get("/api/docks", requireAuth, (req, res) => {
-  res.json({ docks: DOCKS });
+// --- Super-admin: franchise switcher ---
+app.get("/api/admin/franchises", requireAuth, requireSuperAdmin, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT id, slug, name, timezone,
+            twilio_phone_number,
+            (twilio_auth_token IS NOT NULL) AS twilio_configured,
+            created_at
+     FROM franchises ORDER BY name ASC`
+  );
+  res.json({ franchises: rows });
 });
 
-// --- Member upsert helper ---
-async function upsertMember(dbClient, phone, name, email) {
+app.post("/api/admin/switch-franchise", requireAuth, requireSuperAdmin, async (req, res) => {
+  const { franchiseId } = req.body || {};
+  if (!franchiseId) return res.status(400).json({ error: "franchiseId required" });
+  const franchise = await loadFranchise(franchiseId);
+  if (!franchise) return res.status(404).json({ error: "Franchise not found" });
+  req.session.activeFranchiseId = franchise.id;
+  res.json({ success: true, franchise: { id: franchise.id, slug: franchise.slug, name: franchise.name } });
+});
+
+// --- Docks (scoped) ---
+app.get("/api/docks", requireAuth, requireFranchiseContext, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT id, name, sort_order FROM docks WHERE franchise_id = $1 ORDER BY sort_order ASC, name ASC`,
+    [req.franchiseId]
+  );
+  res.json({ docks: rows });
+});
+
+// --- Member helpers ---
+async function upsertMember(client, franchiseId, phone, name, email) {
   if (!phone) return;
-  await dbClient.query(
-    `INSERT INTO members (phone, name, email)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (phone) DO UPDATE
+  await client.query(
+    `INSERT INTO members (franchise_id, phone, name, email)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (franchise_id, phone) DO UPDATE
        SET name = COALESCE(EXCLUDED.name, members.name),
            email = COALESCE(NULLIF(EXCLUDED.email, ''), members.email),
            last_seen = NOW()`,
-    [phone, name || null, email || null]
+    [franchiseId, phone, name || null, email || null]
   );
 }
 
-// --- Find the most recent reservation for a phone (for inbound routing) ---
-async function findReservationByPhone(phone) {
+// Visiting-member lookup: same phone on OTHER franchises. Returns null if
+// the phone is only known to the active franchise.
+async function findHomeFranchises(activeFranchiseId, phone) {
+  if (!phone) return [];
+  const { rows } = await db.query(
+    `SELECT f.id, f.name, f.slug, m.first_seen
+     FROM members m
+     JOIN franchises f ON f.id = m.franchise_id
+     WHERE m.phone = $1 AND m.franchise_id <> $2
+     ORDER BY m.first_seen ASC`,
+    [phone, activeFranchiseId]
+  );
+  return rows;
+}
+
+async function findReservationByPhoneInFranchise(franchiseId, phone) {
   const tail = last10(phone);
-  if (!tail) return null;
+  if (!tail || !franchiseId) return null;
   const { rows } = await db.query(
     `SELECT * FROM reservations
-     WHERE RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $1
+     WHERE franchise_id = $1
+       AND RIGHT(REGEXP_REPLACE(phone, '\\D', '', 'g'), 10) = $2
      ORDER BY reservation_date DESC NULLS LAST, created_at DESC
      LIMIT 1`,
-    [tail]
+    [franchiseId, tail]
   );
   return rows[0] || null;
 }
 
-// --- Reservation row shape (for dashboard compatibility) ---
 function rowToReservation(r) {
   return {
     id: r.id,
@@ -195,39 +316,46 @@ function rowToReservation(r) {
     originalTime: r.original_time,
     dock: r.dock_id,
     sourceId: r.source_id,
+    franchiseId: r.franchise_id,
   };
 }
 
-// --- GET /api/reservations?dock=:id — active (latest batch) for a dock, with per-phone conversation attached ---
-app.get("/api/reservations", requireAuth, async (req, res) => {
+// --- Reservations ---
+app.get("/api/reservations", requireAuth, requireFranchiseContext, async (req, res) => {
   const dockId = req.query.dock;
-  if (!dockId || !DOCK_IDS.has(dockId)) {
-    return res.status(400).json({ error: "Invalid or missing dock parameter", docks: [...DOCK_IDS] });
-  }
+  if (!dockId) return res.status(400).json({ error: "Missing dock parameter" });
+
   try {
+    // Confirm dock belongs to active franchise
+    const { rows: dockRows } = await db.query(
+      `SELECT id FROM docks WHERE id = $1 AND franchise_id = $2`,
+      [dockId, req.franchiseId]
+    );
+    if (dockRows.length === 0) return res.status(404).json({ error: "Dock not found for this franchise" });
+
     const { rows: reservations } = await db.query(
-      `SELECT r.* FROM reservations r
-       WHERE r.dock_id = $1
-         AND r.import_batch_id = (
-           SELECT MAX(id) FROM import_batches WHERE dock_id = $1
+      `SELECT * FROM reservations
+       WHERE franchise_id = $1 AND dock_id = $2
+         AND import_batch_id = (
+           SELECT MAX(id) FROM import_batches WHERE franchise_id = $1 AND dock_id = $2
          )
-       ORDER BY r.reservation_date ASC NULLS LAST`,
-      [dockId]
+       ORDER BY reservation_date ASC NULLS LAST`,
+      [req.franchiseId, dockId]
     );
 
-    // Fetch all messages for the phones on this dock in one query
     const phones = [...new Set(reservations.map((r) => r.phone).filter(Boolean))];
     let messagesByPhone = {};
+    let visitingByPhone = {};
+
     if (phones.length > 0) {
       const { rows: messages } = await db.query(
         `SELECT * FROM messages
-         WHERE phone = ANY($1::text[])
+         WHERE franchise_id = $1 AND phone = ANY($2::text[])
          ORDER BY created_at ASC`,
-        [phones]
+        [req.franchiseId, phones]
       );
       for (const m of messages) {
-        if (!messagesByPhone[m.phone]) messagesByPhone[m.phone] = [];
-        messagesByPhone[m.phone].push({
+        (messagesByPhone[m.phone] = messagesByPhone[m.phone] || []).push({
           from: m.direction === "out" ? "system" : "member",
           text: m.body,
           time: m.created_at,
@@ -236,12 +364,28 @@ app.get("/api/reservations", requireAuth, async (req, res) => {
           reservationId: m.reservation_id,
         });
       }
+
+      // Visiting-member lookup: same phone registered under other franchises
+      const { rows: visits } = await db.query(
+        `SELECT m.phone, f.id AS f_id, f.name AS f_name, f.slug AS f_slug
+         FROM members m
+         JOIN franchises f ON f.id = m.franchise_id
+         WHERE m.phone = ANY($1::text[]) AND m.franchise_id <> $2`,
+        [phones, req.franchiseId]
+      );
+      for (const v of visits) {
+        (visitingByPhone[v.phone] = visitingByPhone[v.phone] || []).push({
+          id: v.f_id, name: v.f_name, slug: v.f_slug,
+        });
+      }
     }
 
     const enriched = reservations.map((r) => ({
       ...rowToReservation(r),
       smsLog: messagesByPhone[r.phone] || [],
+      homeFranchises: visitingByPhone[r.phone] || [],
     }));
+
     res.json({ reservations: enriched, dock: dockId });
   } catch (err) {
     console.error("GET /api/reservations error:", err);
@@ -249,12 +393,21 @@ app.get("/api/reservations", requireAuth, async (req, res) => {
   }
 });
 
-// --- POST /api/reservations/import?dock=:id — append-only ---
-app.post("/api/reservations/import", requireAuth, async (req, res) => {
+app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async (req, res) => {
   const dockId = req.query.dock || req.body.dock;
-  if (!dockId || !DOCK_IDS.has(dockId)) {
-    return res.status(400).json({ error: "Invalid or missing dock parameter" });
+  if (!dockId) return res.status(400).json({ error: "Missing dock parameter" });
+
+  try {
+    const { rows: dockRows } = await db.query(
+      `SELECT id FROM docks WHERE id = $1 AND franchise_id = $2`,
+      [dockId, req.franchiseId]
+    );
+    if (dockRows.length === 0) return res.status(404).json({ error: "Dock not found for this franchise" });
+  } catch (err) {
+    console.error("Dock check error:", err);
+    return res.status(500).json({ error: "Database error" });
   }
+
   const { data } = req.body;
   if (!Array.isArray(data) || data.length === 0) {
     return res.status(400).json({ error: "No reservation data provided" });
@@ -263,8 +416,8 @@ app.post("/api/reservations/import", requireAuth, async (req, res) => {
   try {
     const result = await db.withTx(async (c) => {
       const { rows: [batch] } = await c.query(
-        `INSERT INTO import_batches (dock_id, row_count) VALUES ($1, $2) RETURNING id`,
-        [dockId, data.length]
+        `INSERT INTO import_batches (franchise_id, dock_id, row_count) VALUES ($1,$2,$3) RETURNING id`,
+        [req.franchiseId, dockId, data.length]
       );
       const batchId = batch.id;
       const prefix = dockId.toUpperCase().slice(0, 3);
@@ -272,38 +425,27 @@ app.post("/api/reservations/import", requireAuth, async (req, res) => {
       for (let i = 0; i < data.length; i++) {
         const r = data[i];
         const sourceId = r.id || `${prefix}-${String(i + 1).padStart(3, "0")}`;
-        const reservationId = `${prefix}-B${batchId}-${String(i + 1).padStart(3, "0")}`;
+        const reservationId = `F${req.franchiseId}-${prefix}-B${batchId}-${String(i + 1).padStart(3, "0")}`;
         const normalizedPhone = r.phone ? normalizePhone(r.phone) : "";
 
         if (normalizedPhone) {
-          await upsertMember(c, normalizedPhone, r.name, r.email);
+          await upsertMember(c, req.franchiseId, normalizedPhone, r.name, r.email);
         }
 
         await c.query(
           `INSERT INTO reservations
-           (id, import_batch_id, source_id, dock_id, phone, name, email, service,
+           (id, franchise_id, import_batch_id, source_id, dock_id, phone, name, email, service,
             reservation_date, guests, status, channel, notes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
           [
-            reservationId,
-            batchId,
-            sourceId,
-            dockId,
-            normalizedPhone,
-            r.name || `Guest ${i + 1}`,
-            r.email || "",
-            r.service || "Reservation",
-            r.date || null,
-            r.guests || 1,
-            r.status || "unconfirmed",
-            r.channel || "sms",
-            r.notes || "",
+            reservationId, req.franchiseId, batchId, sourceId, dockId, normalizedPhone,
+            r.name || `Guest ${i + 1}`, r.email || "", r.service || "Reservation",
+            r.date || null, r.guests || 1, r.status || "unconfirmed", r.channel || "sms", r.notes || "",
           ]
         );
       }
       return { batchId, count: data.length };
     });
-
     res.json({ success: true, count: result.count, batchId: result.batchId, dock: dockId });
   } catch (err) {
     console.error("Import error:", err);
@@ -311,14 +453,15 @@ app.post("/api/reservations/import", requireAuth, async (req, res) => {
   }
 });
 
-// --- POST /api/reservations/:id/status — update status ---
-app.post("/api/reservations/:id/status", requireAuth, async (req, res) => {
+app.post("/api/reservations/:id/status", requireAuth, requireFranchiseContext, async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
   try {
     const { rows } = await db.query(
-      `UPDATE reservations SET status = $1 WHERE id = $2 RETURNING *`,
-      [status, id]
+      `UPDATE reservations SET status = $1
+       WHERE id = $2 AND franchise_id = $3
+       RETURNING *`,
+      [status, id, req.franchiseId]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
     res.json({ success: true, reservation: rowToReservation(rows[0]) });
@@ -328,15 +471,11 @@ app.post("/api/reservations/:id/status", requireAuth, async (req, res) => {
   }
 });
 
-// --- SMS Sending ---
+// --- SMS building ---
 function buildSmsBody(reservation) {
   const dateObj = new Date(reservation.reservation_date || reservation.date);
-  const dateStr = dateObj.toLocaleDateString("en-US", {
-    weekday: "long", month: "long", day: "numeric",
-  });
-  const timeStr = dateObj.toLocaleTimeString("en-US", {
-    hour: "numeric", minute: "2-digit",
-  });
+  const dateStr = dateObj.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+  const timeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
   const name = reservation.name || "there";
   return (
     `Hi ${name.split(" ")[0]}! ` +
@@ -346,25 +485,32 @@ function buildSmsBody(reservation) {
   );
 }
 
-async function sendAndLogSms(reservationRow, customBody) {
+async function sendAndLogSms(franchise, reservationRow, customBody) {
+  const client = getTwilioClient(franchise);
+  if (!client) throw new Error(`Twilio is not configured for ${franchise.name}`);
   if (!reservationRow.phone) throw new Error("No phone number on file");
   const toPhone = normalizePhone(reservationRow.phone);
   if (!toPhone || toPhone.length < 10) throw new Error("Invalid phone number format");
 
   const body = customBody || buildSmsBody(reservationRow);
+  const statusCallback = franchise.base_url
+    ? `${franchise.base_url.replace(/\/+$/, "")}/api/sms/status`
+    : undefined;
 
   const message = await client.messages.create({
     body,
-    ...(messagingServiceSid ? { messagingServiceSid } : { from: twilioPhone }),
+    ...(franchise.twilio_messaging_service_sid
+      ? { messagingServiceSid: franchise.twilio_messaging_service_sid }
+      : { from: franchise.twilio_phone_number }),
     to: toPhone,
-    statusCallback: baseUrl ? `${baseUrl}/api/sms/status` : undefined,
+    statusCallback,
   });
 
   await db.withTx(async (c) => {
     await c.query(
-      `INSERT INTO messages (phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status)
-       VALUES ($1, $2, $3, 'out', $4, $5, $6)`,
-      [toPhone, reservationRow.id, reservationRow.dock_id, body, message.sid, message.status]
+      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status)
+       VALUES ($1,$2,$3,$4,'out',$5,$6,$7)`,
+      [franchise.id, toPhone, reservationRow.id, reservationRow.dock_id, body, message.sid, message.status]
     );
     await c.query(
       `UPDATE reservations
@@ -374,20 +520,22 @@ async function sendAndLogSms(reservationRow, customBody) {
        WHERE id = $1`,
       [reservationRow.id]
     );
-    await upsertMember(c, toPhone, reservationRow.name, reservationRow.email);
+    await upsertMember(c, franchise.id, toPhone, reservationRow.name, reservationRow.email);
   });
 
   return message;
 }
 
-// POST /api/sms/send/:id
-app.post("/api/sms/send/:id", requireAuth, async (req, res) => {
+app.post("/api/sms/send/:id", requireAuth, requireFranchiseContext, async (req, res) => {
   const { id } = req.params;
   const { customBody } = req.body || {};
   try {
-    const { rows } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
+    const { rows } = await db.query(
+      `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
+      [id, req.franchiseId]
+    );
     if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
-    const message = await sendAndLogSms(rows[0], customBody);
+    const message = await sendAndLogSms(req.franchise, rows[0], customBody);
     const { rows: updated } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
     res.json({ success: true, messageSid: message.sid, reservation: rowToReservation(updated[0]) });
   } catch (err) {
@@ -396,30 +544,26 @@ app.post("/api/sms/send/:id", requireAuth, async (req, res) => {
   }
 });
 
-// POST /api/sms/send-bulk
-app.post("/api/sms/send-bulk", requireAuth, async (req, res) => {
+app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req, res) => {
   const { ids, dock: dockId } = req.body;
-  if (!dockId || !DOCK_IDS.has(dockId)) {
-    return res.status(400).json({ error: "Invalid or missing dock parameter" });
-  }
+  if (!dockId) return res.status(400).json({ error: "Missing dock parameter" });
 
   let targets;
   try {
     if (ids === "all") {
       const { rows } = await db.query(
         `SELECT * FROM reservations
-         WHERE dock_id = $1
-           AND import_batch_id = (SELECT MAX(id) FROM import_batches WHERE dock_id = $1)
-           AND message_sent = FALSE
-           AND phone <> ''`,
-        [dockId]
+         WHERE franchise_id = $1 AND dock_id = $2
+           AND import_batch_id = (SELECT MAX(id) FROM import_batches WHERE franchise_id = $1 AND dock_id = $2)
+           AND message_sent = FALSE AND phone <> ''`,
+        [req.franchiseId, dockId]
       );
       targets = rows;
     } else if (Array.isArray(ids)) {
       const { rows } = await db.query(
         `SELECT * FROM reservations
-         WHERE id = ANY($1::text[]) AND message_sent = FALSE AND phone <> ''`,
-        [ids]
+         WHERE id = ANY($1::text[]) AND franchise_id = $2 AND message_sent = FALSE AND phone <> ''`,
+        [ids, req.franchiseId]
       );
       targets = rows;
     } else {
@@ -433,7 +577,7 @@ app.post("/api/sms/send-bulk", requireAuth, async (req, res) => {
   const results = { sent: 0, failed: 0, errors: [] };
   for (const r of targets) {
     try {
-      await sendAndLogSms(r);
+      await sendAndLogSms(req.franchise, r);
       results.sent++;
     } catch (err) {
       console.error(`SMS failed for ${r.id}:`, err.message);
@@ -444,12 +588,50 @@ app.post("/api/sms/send-bulk", requireAuth, async (req, res) => {
   res.json({ success: true, ...results });
 });
 
-// --- Twilio Webhooks ---
+// --- Admin chat box — send arbitrary SMS to a reservation's phone ---
+app.post("/api/sms/simulate", requireAuth, requireFranchiseContext, async (req, res) => {
+  const { id, reply } = req.body;
+  if (!id || !reply) return res.status(400).json({ error: "Missing id or reply" });
 
-// --- Natural-language reply parsing ---
-// Given an inbound text and (optionally) the matched reservation row, updates
-// the reservation in Postgres and returns the canned response string. All
-// message persistence happens in the caller.
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
+      [id, req.franchiseId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
+    const reservation = rows[0];
+    if (!reservation.phone) return res.status(400).json({ error: "No phone number on file for this reservation" });
+
+    const client = getTwilioClient(req.franchise);
+    if (!client) return res.status(400).json({ error: `Twilio is not configured for ${req.franchise.name}` });
+
+    const toPhone = normalizePhone(reservation.phone);
+    if (!toPhone || toPhone.length < 10) return res.status(400).json({ error: "Invalid phone number format" });
+
+    const message = await client.messages.create({
+      body: reply,
+      ...(req.franchise.twilio_messaging_service_sid
+        ? { messagingServiceSid: req.franchise.twilio_messaging_service_sid }
+        : { from: req.franchise.twilio_phone_number }),
+      to: toPhone,
+      statusCallback: req.franchise.base_url
+        ? `${req.franchise.base_url.replace(/\/+$/, "")}/api/sms/status`
+        : undefined,
+    });
+
+    await db.query(
+      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status)
+       VALUES ($1,$2,$3,$4,'out',$5,$6,$7)`,
+      [req.franchiseId, toPhone, reservation.id, reservation.dock_id, reply, message.sid, message.status]
+    );
+    res.json({ success: true, messageSid: message.sid });
+  } catch (err) {
+    console.error("Twilio send error (chat):", err.message);
+    res.status(500).json({ error: `Failed to send: ${err.message}` });
+  }
+});
+
+// --- Inbound reply parsing (Postgres-native) ---
 async function parseAndApplyReply(inboundText, reservation) {
   const replyLower = inboundText.toLowerCase().replace(/[^a-z0-9\s:]/g, "").trim();
 
@@ -469,12 +651,10 @@ async function parseAndApplyReply(inboundText, reservation) {
     await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
     return "Thank you! Your reservation is confirmed. We look forward to seeing you!";
   }
-
   if (cancelPatterns.test(replyLower) || cancelLoose.test(replyLower)) {
     await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
     return "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
   }
-
   if (timeMatch) {
     let h = parseInt(timeMatch[1]);
     const m = parseInt(timeMatch[2] || "0");
@@ -504,66 +684,53 @@ async function parseAndApplyReply(inboundText, reservation) {
   );
 }
 
-// POST /api/sms/simulate — admin-composed SMS sent via Twilio from the dashboard chat box
-app.post("/api/sms/simulate", requireAuth, async (req, res) => {
-  const { id, reply } = req.body;
-  if (!id || !reply) return res.status(400).json({ error: "Missing id or reply" });
+// --- Twilio inbound webhook ---
+// Routes by the `To` number to the franchise, then validates the signature
+// with THAT franchise's auth token before trusting the request.
+app.post("/api/sms/incoming", express.urlencoded({ extended: false }), async (req, res) => {
+  const { From, To, Body } = req.body;
+  const franchise = await findFranchiseByInboundTo(To);
 
-  try {
-    const { rows } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
-    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
-    const reservation = rows[0];
-    if (!reservation.phone) return res.status(400).json({ error: "No phone number on file for this reservation" });
-
-    const toPhone = normalizePhone(reservation.phone);
-    if (!toPhone || toPhone.length < 10) return res.status(400).json({ error: "Invalid phone number format" });
-
-    const message = await client.messages.create({
-      body: reply,
-      ...(messagingServiceSid ? { messagingServiceSid } : { from: twilioPhone }),
-      to: toPhone,
-      statusCallback: baseUrl ? `${baseUrl}/api/sms/status` : undefined,
-    });
-
-    await db.query(
-      `INSERT INTO messages (phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status)
-       VALUES ($1, $2, $3, 'out', $4, $5, $6)`,
-      [toPhone, reservation.id, reservation.dock_id, reply, message.sid, message.status]
-    );
-    res.json({ success: true, messageSid: message.sid });
-  } catch (err) {
-    console.error("Twilio send error (chat):", err.message);
-    res.status(500).json({ error: `Failed to send: ${err.message}` });
+  if (!franchise) {
+    console.warn(`Inbound SMS to unknown number: ${To}`);
+    return res.status(404).send("Unknown recipient");
   }
-});
 
-// POST /api/sms/incoming — Twilio inbound webhook
-app.post("/api/sms/incoming", twilioWebhookValidation, async (req, res) => {
-  const { From, Body } = req.body;
+  // Validate Twilio signature with this franchise's auth token, in prod only.
+  if (isProduction && franchise.twilio_auth_token) {
+    const signature = req.headers["x-twilio-signature"];
+    const url = (franchise.base_url ? franchise.base_url.replace(/\/+$/, "") : "") + "/api/sms/incoming";
+    const valid = twilio.validateRequest(franchise.twilio_auth_token, signature, url, req.body);
+    if (!valid) {
+      console.warn(`Invalid Twilio signature for franchise ${franchise.id}`);
+      return res.status(403).send("Invalid signature");
+    }
+  }
+
   const inboundText = (Body || "").trim();
   const normalizedFrom = normalizePhone(From);
 
   let responseText;
   try {
-    const reservation = await findReservationByPhone(From);
+    const reservation = await findReservationByPhoneInFranchise(franchise.id, From);
 
-    // Log inbound first — even without a matching reservation, so a stale
-    // reply still shows up in the per-phone conversation history.
     await db.query(
-      `INSERT INTO messages (phone, reservation_id, dock_id, direction, body)
-       VALUES ($1, $2, $3, 'in', $4)`,
-      [normalizedFrom, reservation ? reservation.id : null, reservation ? reservation.dock_id : null, inboundText]
+      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body)
+       VALUES ($1,$2,$3,$4,'in',$5)`,
+      [franchise.id, normalizedFrom, reservation ? reservation.id : null,
+       reservation ? reservation.dock_id : null, inboundText]
     );
     await db.withTx(async (c) => {
-      await upsertMember(c, normalizedFrom, reservation ? reservation.name : null, null);
+      await upsertMember(c, franchise.id, normalizedFrom, reservation ? reservation.name : null, null);
     });
 
     responseText = await parseAndApplyReply(inboundText, reservation);
 
     await db.query(
-      `INSERT INTO messages (phone, reservation_id, dock_id, direction, body)
-       VALUES ($1, $2, $3, 'out', $4)`,
-      [normalizedFrom, reservation ? reservation.id : null, reservation ? reservation.dock_id : null, responseText]
+      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body)
+       VALUES ($1,$2,$3,$4,'out',$5)`,
+      [franchise.id, normalizedFrom, reservation ? reservation.id : null,
+       reservation ? reservation.dock_id : null, responseText]
     );
   } catch (err) {
     console.error("Inbound webhook error:", err);
@@ -575,8 +742,9 @@ app.post("/api/sms/incoming", twilioWebhookValidation, async (req, res) => {
   res.type("text/xml").send(twiml.toString());
 });
 
-// POST /api/sms/status
-app.post("/api/sms/status", twilioWebhookValidation, async (req, res) => {
+// Delivery-status callback. We don't bother validating signature here — the
+// worst case is a bogus status flag, and the SID is the join key anyway.
+app.post("/api/sms/status", express.urlencoded({ extended: false }), async (req, res) => {
   const { MessageSid, MessageStatus } = req.body;
   try {
     await db.query(
@@ -589,23 +757,25 @@ app.post("/api/sms/status", twilioWebhookValidation, async (req, res) => {
   res.sendStatus(200);
 });
 
-// --- Conversations ---
-
-// GET /api/sms/log/:id?dock=:id — backwards-compatible per-reservation view,
-// but returns the full PHONE conversation so the drawer shows all history
-app.get("/api/sms/log/:id", requireAuth, async (req, res) => {
+// --- Conversations (scoped) ---
+app.get("/api/sms/log/:id", requireAuth, requireFranchiseContext, async (req, res) => {
   const { id } = req.params;
   try {
-    const { rows } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
+    const { rows } = await db.query(
+      `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
+      [id, req.franchiseId]
+    );
     if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
     const reservation = rows[0];
 
     const { rows: messages } = await db.query(
-      `SELECT * FROM messages WHERE phone = $1 ORDER BY created_at ASC`,
-      [reservation.phone]
+      `SELECT * FROM messages WHERE franchise_id = $1 AND phone = $2 ORDER BY created_at ASC`,
+      [req.franchiseId, reservation.phone]
     );
+    const homeFranchises = await findHomeFranchises(req.franchiseId, reservation.phone);
     res.json({
       reservation: rowToReservation(reservation),
+      homeFranchises,
       smsLog: messages.map((m) => ({
         from: m.direction === "out" ? "system" : "member",
         text: m.body,
@@ -621,8 +791,7 @@ app.get("/api/sms/log/:id", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/conversations — list every member with a message history
-app.get("/api/conversations", requireAuth, async (req, res) => {
+app.get("/api/conversations", requireAuth, requireFranchiseContext, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT
@@ -635,37 +804,58 @@ app.get("/api/conversations", requireAuth, async (req, res) => {
          (ARRAY_AGG(m.direction ORDER BY m.created_at DESC))[1] AS last_direction,
          (ARRAY_AGG(m.dock_id ORDER BY m.created_at DESC))[1] AS last_dock_id
        FROM messages m
-       LEFT JOIN members mem ON mem.phone = m.phone
+       LEFT JOIN members mem ON mem.phone = m.phone AND mem.franchise_id = m.franchise_id
        LEFT JOIN LATERAL (
          SELECT name FROM reservations r
-         WHERE r.phone = m.phone
+         WHERE r.phone = m.phone AND r.franchise_id = m.franchise_id
          ORDER BY r.created_at DESC LIMIT 1
        ) r_last ON TRUE
+       WHERE m.franchise_id = $1
        GROUP BY m.phone, mem.name, mem.email, r_last.name
-       ORDER BY MAX(m.created_at) DESC`
+       ORDER BY MAX(m.created_at) DESC`,
+      [req.franchiseId]
     );
-    res.json({ conversations: rows });
+
+    const phones = rows.map((r) => r.phone).filter(Boolean);
+    let visiting = {};
+    if (phones.length > 0) {
+      const { rows: visits } = await db.query(
+        `SELECT m.phone, f.id, f.name, f.slug
+         FROM members m
+         JOIN franchises f ON f.id = m.franchise_id
+         WHERE m.phone = ANY($1::text[]) AND m.franchise_id <> $2`,
+        [phones, req.franchiseId]
+      );
+      for (const v of visits) {
+        (visiting[v.phone] = visiting[v.phone] || []).push({ id: v.id, name: v.name, slug: v.slug });
+      }
+    }
+
+    res.json({
+      conversations: rows.map((c) => ({ ...c, home_franchises: visiting[c.phone] || [] })),
+    });
   } catch (err) {
     console.error("Conversations list error:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// GET /api/conversations/:phone — full timeline + reservation history
-app.get("/api/conversations/:phone", requireAuth, async (req, res) => {
+app.get("/api/conversations/:phone", requireAuth, requireFranchiseContext, async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   try {
-    const [{ rows: member }, { rows: messages }, { rows: reservations }] = await Promise.all([
-      db.query(`SELECT * FROM members WHERE phone = $1`, [phone]),
-      db.query(`SELECT * FROM messages WHERE phone = $1 ORDER BY created_at ASC`, [phone]),
+    const [{ rows: member }, { rows: messages }, { rows: reservations }, homeFranchises] = await Promise.all([
+      db.query(`SELECT * FROM members WHERE franchise_id = $1 AND phone = $2`, [req.franchiseId, phone]),
+      db.query(`SELECT * FROM messages WHERE franchise_id = $1 AND phone = $2 ORDER BY created_at ASC`, [req.franchiseId, phone]),
       db.query(
-        `SELECT * FROM reservations WHERE phone = $1 ORDER BY reservation_date DESC NULLS LAST`,
-        [phone]
+        `SELECT * FROM reservations WHERE franchise_id = $1 AND phone = $2 ORDER BY reservation_date DESC NULLS LAST`,
+        [req.franchiseId, phone]
       ),
+      findHomeFranchises(req.franchiseId, phone),
     ]);
     res.json({
       phone,
       member: member[0] || null,
+      homeFranchises,
       messages: messages.map((m) => ({
         from: m.direction === "out" ? "system" : "member",
         text: m.body,
@@ -685,17 +875,13 @@ app.get("/api/conversations/:phone", requireAuth, async (req, res) => {
 
 // --- Health ---
 app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    twilioConfigured: !!(accountSid && authToken && twilioPhone),
-  });
+  res.json({ status: "ok" });
 });
 
-// --- Static ---
+// --- Root + static ---
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 app.use(express.static(path.join(__dirname, "public")));
-app.get("/dashboard", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
+app.get("/dashboard", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
 // --- Start ---
 async function start() {
@@ -706,16 +892,8 @@ async function start() {
     if (isProduction) process.exit(1);
   }
   app.listen(PORT, () => {
-    console.log(`\nReservation SMS server running on port ${PORT}`);
+    console.log(`\nReservation SMS (multi-tenant) running on port ${PORT}`);
     console.log(`   Health check: http://localhost:${PORT}/api/health`);
-    if (!accountSid || !authToken || !twilioPhone) {
-      console.log(`\n   Twilio credentials not configured!`);
-      console.log(`   Copy env.example.txt to .env and add your credentials.\n`);
-    } else {
-      console.log(`   Twilio phone: ${twilioPhone}`);
-      if (messagingServiceSid) console.log(`   Messaging Service: ${messagingServiceSid}`);
-      console.log(`   Webhook URL:  ${baseUrl || "http://localhost:" + PORT}/api/sms/incoming\n`);
-    }
   });
 }
 
