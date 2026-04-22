@@ -67,6 +67,24 @@ const api = {
     return res.json();
   },
 
+  async forgotPassword(email) {
+    const res = await fetch(`${API_BASE}/api/forgot-password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    });
+    return res.json();
+  },
+
+  async resetPassword(token, password) {
+    const res = await fetch(`${API_BASE}/api/reset-password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, password }),
+    });
+    return res.json();
+  },
+
   async logout() {
     const res = await fetch(`${API_BASE}/api/logout`, {
       method: "POST",
@@ -2689,7 +2707,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
 }
 
 // --- Login Screen ---
-function LoginScreen({ onLogin }) {
+function LoginScreen({ onLogin, onForgotPassword }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -2806,6 +2824,177 @@ function LoginScreen({ onLogin }) {
         >
           {loading ? "Signing in..." : "Sign In"}
         </button>
+        <button
+          type="button"
+          onClick={onForgotPassword}
+          style={{
+            marginTop: 14, background: "transparent", border: "none",
+            color: "rgba(255,255,255,0.55)", fontSize: 12, cursor: "pointer",
+            fontFamily: "inherit",
+          }}
+        >Forgot password?</button>
+      </form>
+    </div>
+  );
+}
+
+// --- Forgot password (email submission) ---
+function ForgotPasswordScreen({ onBack }) {
+  const [email, setEmail] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError(""); setLoading(true);
+    try {
+      const r = await api.forgotPassword(email);
+      if (r.success) setSent(true);
+      else setError(r.error || "Something went wrong");
+    } catch {
+      setError("Connection error. Please try again.");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
+      fontFamily: "'Montserrat', sans-serif",
+    }}>
+      <form onSubmit={submit} style={{
+        background: "rgba(255,255,255,0.07)", backdropFilter: "blur(12px)",
+        borderRadius: 16, padding: "48px 40px", width: 380, maxWidth: "90vw",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)",
+        textAlign: "center",
+      }}>
+        <h1 style={{ color: "#fff", fontSize: 20, marginBottom: 8, fontWeight: 700 }}>Reset your password</h1>
+        {sent ? (
+          <>
+            <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, marginBottom: 20, lineHeight: 1.6 }}>
+              If an account exists for <strong>{email}</strong>, a reset link has been sent.
+              Check your inbox — the link expires in 1 hour.
+            </p>
+            <button type="button" onClick={onBack} style={{
+              width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
+              background: "linear-gradient(135deg, #0ea5e9, #2563eb)", color: "#fff",
+              fontSize: 14, fontWeight: 600, cursor: "pointer",
+            }}>Back to sign in</button>
+          </>
+        ) : (
+          <>
+            <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginBottom: 24 }}>
+              We'll email you a link to set a new password.
+            </p>
+            {error && (
+              <div style={{
+                background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)",
+                color: "#fca5a5", borderRadius: 8, padding: "10px 14px",
+                fontSize: 13, marginBottom: 16,
+              }}>{error}</div>
+            )}
+            <input
+              type="email" placeholder="Email" value={email} autoFocus required
+              onChange={(e) => setEmail(e.target.value)}
+              style={{
+                width: "100%", padding: "12px 16px", borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.15)",
+                background: "rgba(255,255,255,0.08)", color: "#fff",
+                fontSize: 15, outline: "none", marginBottom: 16, boxSizing: "border-box",
+              }}
+            />
+            <button type="submit" disabled={loading || !email} style={{
+              width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
+              background: loading ? "#555" : "linear-gradient(135deg, #0ea5e9, #2563eb)",
+              color: "#fff", fontSize: 15, fontWeight: 600,
+              cursor: loading ? "not-allowed" : "pointer",
+            }}>{loading ? "Sending..." : "Send reset link"}</button>
+            <button type="button" onClick={onBack} style={{
+              marginTop: 14, background: "transparent", border: "none",
+              color: "rgba(255,255,255,0.55)", fontSize: 12, cursor: "pointer",
+              fontFamily: "inherit",
+            }}>← Back to sign in</button>
+          </>
+        )}
+      </form>
+    </div>
+  );
+}
+
+// --- Reset password (entered from email link with ?reset=TOKEN) ---
+function ResetPasswordScreen({ token, onComplete }) {
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError("");
+    if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
+    if (password !== confirm) { setError("Passwords don't match."); return; }
+    setLoading(true);
+    try {
+      const r = await api.resetPassword(token, password);
+      if (r.success) onComplete();
+      else setError(r.error || "Could not reset password");
+    } catch {
+      setError("Connection error. Please try again.");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
+      fontFamily: "'Montserrat', sans-serif",
+    }}>
+      <form onSubmit={submit} style={{
+        background: "rgba(255,255,255,0.07)", backdropFilter: "blur(12px)",
+        borderRadius: 16, padding: "48px 40px", width: 380, maxWidth: "90vw",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)",
+        textAlign: "center",
+      }}>
+        <h1 style={{ color: "#fff", fontSize: 20, marginBottom: 8, fontWeight: 700 }}>Set a new password</h1>
+        <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginBottom: 24 }}>
+          At least 8 characters.
+        </p>
+        {error && (
+          <div style={{
+            background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)",
+            color: "#fca5a5", borderRadius: 8, padding: "10px 14px",
+            fontSize: 13, marginBottom: 16,
+          }}>{error}</div>
+        )}
+        <input
+          type="password" placeholder="New password" value={password} autoFocus required
+          autoComplete="new-password" onChange={(e) => setPassword(e.target.value)}
+          style={{
+            width: "100%", padding: "12px 16px", borderRadius: 8,
+            border: "1px solid rgba(255,255,255,0.15)",
+            background: "rgba(255,255,255,0.08)", color: "#fff",
+            fontSize: 15, outline: "none", marginBottom: 12, boxSizing: "border-box",
+          }}
+        />
+        <input
+          type="password" placeholder="Confirm new password" value={confirm} required
+          autoComplete="new-password" onChange={(e) => setConfirm(e.target.value)}
+          style={{
+            width: "100%", padding: "12px 16px", borderRadius: 8,
+            border: "1px solid rgba(255,255,255,0.15)",
+            background: "rgba(255,255,255,0.08)", color: "#fff",
+            fontSize: 15, outline: "none", marginBottom: 20, boxSizing: "border-box",
+          }}
+        />
+        <button type="submit" disabled={loading || !password || !confirm} style={{
+          width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
+          background: loading ? "#555" : "linear-gradient(135deg, #0ea5e9, #2563eb)",
+          color: "#fff", fontSize: 15, fontWeight: 600,
+          cursor: loading ? "not-allowed" : "pointer",
+        }}>{loading ? "Updating..." : "Update password"}</button>
       </form>
     </div>
   );
@@ -2864,6 +3053,14 @@ function FranchisePickerScreen({ onPicked, onLogout }) {
 function App() {
   const [authState, setAuthState] = useState("checking"); // checking | anon | needsFranchise | authed
   const [me, setMe] = useState(null);
+  const [screen, setScreen] = useState("login"); // login | forgot
+  // Check for ?reset=TOKEN in the URL. If present, override everything and
+  // show the password reset form until the user completes or navigates away.
+  const [resetToken, setResetToken] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("reset");
+  });
+  const [resetDone, setResetDone] = useState(false);
 
   const bootstrap = useCallback(async () => {
     try {
@@ -2879,13 +3076,48 @@ function App() {
     }
   }, []);
 
-  useEffect(() => { bootstrap(); }, [bootstrap]);
+  useEffect(() => { if (!resetToken) bootstrap(); else setAuthState("anon"); }, [bootstrap, resetToken]);
 
   const handleLogout = async () => {
     try { await api.logout(); } catch {}
     setMe(null);
     setAuthState("anon");
+    setScreen("login");
   };
+
+  // Reset-password flow (triggered by email link with ?reset=TOKEN)
+  if (resetToken && !resetDone) {
+    return (
+      <ResetPasswordScreen
+        token={resetToken}
+        onComplete={() => {
+          setResetDone(true);
+          setResetToken(null);
+          // Strip the token from the URL so it's not bookmarked or re-used
+          window.history.replaceState({}, "", window.location.pathname);
+        }}
+      />
+    );
+  }
+  if (resetDone) {
+    // Brief confirmation → fall through to login
+    return (
+      <div style={{
+        minHeight: "100vh", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", gap: 20,
+        background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
+        fontFamily: "'Montserrat', sans-serif", color: "#fff",
+      }}>
+        <div style={{ fontSize: 40 }}>✓</div>
+        <h1 style={{ fontSize: 20, fontWeight: 700 }}>Password updated</h1>
+        <button onClick={() => setResetDone(false)} style={{
+          padding: "12px 28px", borderRadius: 8, border: "none",
+          background: "linear-gradient(135deg, #0ea5e9, #2563eb)", color: "#fff",
+          fontSize: 14, fontWeight: 600, cursor: "pointer",
+        }}>Sign in</button>
+      </div>
+    );
+  }
 
   if (authState === "checking") {
     return (
@@ -2896,7 +3128,10 @@ function App() {
       }}>Loading...</div>
     );
   }
-  if (authState === "anon") return <LoginScreen onLogin={bootstrap} />;
+  if (authState === "anon") {
+    if (screen === "forgot") return <ForgotPasswordScreen onBack={() => setScreen("login")} />;
+    return <LoginScreen onLogin={bootstrap} onForgotPassword={() => setScreen("forgot")} />;
+  }
   if (authState === "needsFranchise") return <FranchisePickerScreen onPicked={bootstrap} onLogout={handleLogout} />;
   return <ReservationDashboard onLogout={handleLogout} me={me} onFranchiseChanged={bootstrap} />;
 }

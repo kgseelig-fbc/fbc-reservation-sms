@@ -193,6 +193,130 @@ app.get("/api/session", (req, res) => {
   });
 });
 
+// --- Forgot / reset password ---
+const email = require("./lib/email");
+
+const forgotLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5, // per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many reset requests, please try again later" },
+});
+
+const resetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+// Returns the public origin of this request so reset links point at the UI the
+// user came from. Falls back to host header.
+function originFromRequest(req) {
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
+
+// POST /api/forgot-password — always returns 200 to avoid leaking which emails
+// are registered. If the email exists, a one-hour token is emailed.
+app.post("/api/forgot-password", forgotLimiter, async (req, res) => {
+  const email_ = (req.body?.email || "").toLowerCase().trim();
+  if (!email_) return res.status(400).json({ error: "Email is required" });
+
+  const genericOk = { success: true, message: "If an account exists for that email, a reset link has been sent." };
+
+  try {
+    const { rows } = await db.query(
+      `SELECT id, email FROM users WHERE email = $1`,
+      [email_]
+    );
+    const user = rows[0];
+    if (!user) return res.json(genericOk);
+
+    // Invalidate any prior unused tokens for this user (optional — limits blast radius).
+    await db.query(
+      `UPDATE password_resets SET used_at = NOW()
+       WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()`,
+      [user.id]
+    );
+
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashToken(rawToken);
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await db.query(
+      `INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
+      [user.id, tokenHash, expiresAt]
+    );
+
+    const origin = originFromRequest(req);
+    const resetUrl = `${origin}/?reset=${rawToken}`;
+    const subject = "Reset your Reservation SMS Dashboard password";
+    const text =
+      `Someone requested a password reset for your account (${user.email}).\n\n` +
+      `If that was you, click this link within 1 hour to set a new password:\n` +
+      `${resetUrl}\n\n` +
+      `If you didn't request this, you can ignore this email — your password stays the same.`;
+    const html =
+      `<p>Someone requested a password reset for your account (<strong>${user.email}</strong>).</p>` +
+      `<p>If that was you, click the link below within 1 hour to set a new password:</p>` +
+      `<p><a href="${resetUrl}" style="background:#0ea5e9;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;">Reset password</a></p>` +
+      `<p style="font-size:12px;color:#666">Or copy this link: <br><code>${resetUrl}</code></p>` +
+      `<p style="font-size:12px;color:#666">If you didn't request this, you can ignore this email — your password stays the same.</p>`;
+
+    try {
+      await email.sendEmail({ to: user.email, subject, text, html });
+    } catch (mailErr) {
+      console.error("Reset email send failed:", mailErr.message);
+      // Don't reveal failure to the caller — the token is still valid and the
+      // link is in server logs for manual recovery if SMTP is misconfigured.
+    }
+
+    res.json(genericOk);
+  } catch (err) {
+    console.error("Forgot-password error:", err);
+    res.json(genericOk); // still return generic success shape
+  }
+});
+
+// POST /api/reset-password — redeem a token, set new password.
+app.post("/api/reset-password", resetLimiter, async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: "Token and password are required" });
+  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+  try {
+    const tokenHash = hashToken(token);
+    const { rows } = await db.query(
+      `SELECT pr.id, pr.user_id, pr.expires_at, pr.used_at
+       FROM password_resets pr
+       WHERE pr.token_hash = $1`,
+      [tokenHash]
+    );
+    const reset = rows[0];
+    if (!reset) return res.status(400).json({ error: "Invalid or expired reset link" });
+    if (reset.used_at) return res.status(400).json({ error: "This reset link has already been used" });
+    if (new Date(reset.expires_at) < new Date()) return res.status(400).json({ error: "This reset link has expired" });
+
+    const hash = await bcrypt.hash(password, 12);
+    await db.withTx(async (c) => {
+      await c.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [hash, reset.user_id]);
+      await c.query(`UPDATE password_resets SET used_at = NOW() WHERE id = $1`, [reset.id]);
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Reset-password error:", err);
+    res.status(500).json({ error: "Failed to reset password" });
+  }
+});
+
 // GET /api/me — current user, active franchise, dock list, branding
 app.get("/api/me", requireAuth, async (req, res) => {
   try {
