@@ -10,9 +10,9 @@ const twilio = require("twilio");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const session = require("express-session");
-const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const path = require("path");
+const { OAuth2Client } = require("google-auth-library");
 const db = require("./db");
 
 const app = express();
@@ -122,6 +122,9 @@ function requireAuth(req, res, next) {
   if (!req.session || !req.session.userId) {
     return res.status(401).json({ error: "Authentication required" });
   }
+  if (req.session.status && req.session.status !== "approved") {
+    return res.status(403).json({ error: "Account pending approval", pendingApproval: true, status: req.session.status });
+  }
   next();
 }
 
@@ -144,35 +147,109 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
-// --- Auth routes ---
-app.post("/api/login", loginLimiter, async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+// Returns the public origin of this request so OAuth redirects point at the UI the
+// user came from. Falls back to host header.
+function originFromRequest(req) {
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
+
+// --- Google OAuth ---
+const googleClientId = process.env.GOOGLE_CLIENT_ID;
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+function googleRedirectUri(req) {
+  if (process.env.GOOGLE_OAUTH_REDIRECT_URL) return process.env.GOOGLE_OAUTH_REDIRECT_URL;
+  return `${originFromRequest(req)}/api/auth/google/callback`;
+}
+
+function googleOAuthClient(req) {
+  if (!googleClientId || !googleClientSecret) return null;
+  return new OAuth2Client(googleClientId, googleClientSecret, googleRedirectUri(req));
+}
+
+// Kick off the OAuth dance. We sign a CSRF state into the session so the
+// callback can prove this exact browser started the flow.
+app.get("/api/auth/google", loginLimiter, (req, res) => {
+  const client = googleOAuthClient(req);
+  if (!client) return res.status(500).json({ error: "Google SSO is not configured" });
+  const state = crypto.randomBytes(24).toString("hex");
+  req.session.oauthState = state;
+  const url = client.generateAuthUrl({
+    access_type: "online",
+    prompt: "select_account",
+    scope: ["openid", "email", "profile"],
+    state,
+  });
+  res.redirect(url);
+});
+
+// Callback: verify the ID token, find-or-create the user, set session.
+// Brand-new users land in status='pending' with no role/franchise — a
+// super_admin must approve them before requireAuth lets them through.
+app.get("/api/auth/google/callback", loginLimiter, async (req, res) => {
+  const client = googleOAuthClient(req);
+  if (!client) return res.status(500).send("Google SSO is not configured");
+  const { code, state } = req.query;
+  if (!code || !state || state !== req.session.oauthState) {
+    return res.redirect("/?sso_error=state");
+  }
+  delete req.session.oauthState;
 
   try {
+    const { tokens } = await client.getToken(code);
+    const ticket = await client.verifyIdToken({ idToken: tokens.id_token, audience: googleClientId });
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email) return res.redirect("/?sso_error=verify");
+    if (!payload.email_verified) return res.redirect("/?sso_error=unverified");
+
+    const email = payload.email.toLowerCase();
+    const googleId = payload.sub;
+    const fullName = payload.name || null;
+    const avatarUrl = payload.picture || null;
+
+    // Match on google_id first, then fall back to email so existing
+    // pre-SSO accounts (e.g. the bootstrap super_admin) link cleanly.
     const { rows } = await db.query(
-      `SELECT id, email, password_hash, role, franchise_id FROM users WHERE email = $1`,
-      [email.toLowerCase().trim()]
+      `SELECT * FROM users WHERE google_id = $1 OR email = $2 ORDER BY (google_id IS NOT NULL) DESC LIMIT 1`,
+      [googleId, email]
     );
-    const user = rows[0];
-    const ok = user && await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: "Invalid email or password" });
+    let user = rows[0];
+
+    if (!user) {
+      const inserted = await db.query(
+        `INSERT INTO users (email, google_id, name, avatar_url, status)
+         VALUES ($1, $2, $3, $4, 'pending')
+         RETURNING *`,
+        [email, googleId, fullName, avatarUrl]
+      );
+      user = inserted.rows[0];
+    } else {
+      const updated = await db.query(
+        `UPDATE users
+            SET google_id  = COALESCE(google_id, $1),
+                name       = COALESCE($2, name),
+                avatar_url = COALESCE($3, avatar_url),
+                last_login = NOW()
+          WHERE id = $4
+        RETURNING *`,
+        [googleId, fullName, avatarUrl, user.id]
+      );
+      user = updated.rows[0];
+    }
 
     req.session.userId = user.id;
     req.session.email = user.email;
     req.session.role = user.role;
-    req.session.franchiseId = user.franchise_id; // home franchise (null for super_admin)
-    req.session.activeFranchiseId = user.franchise_id; // super_admin picks one via /api/admin/switch-franchise
+    req.session.status = user.status;
+    req.session.franchiseId = user.franchise_id;
+    req.session.activeFranchiseId = user.franchise_id;
 
-    await db.query(`UPDATE users SET last_login = NOW() WHERE id = $1`, [user.id]);
-    res.json({
-      success: true,
-      user: { email: user.email, role: user.role, franchiseId: user.franchise_id },
-      needsFranchiseSelection: user.role === "super_admin",
-    });
+    res.redirect("/");
   } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ error: "Login failed" });
+    console.error("Google OAuth callback error:", err);
+    res.redirect("/?sso_error=exchange");
   }
 });
 
@@ -185,136 +262,16 @@ app.post("/api/logout", (req, res) => {
 });
 
 app.get("/api/session", (req, res) => {
+  const status = req.session?.status || null;
+  const authenticated = !!(req.session && req.session.userId);
   res.json({
-    authenticated: !!(req.session && req.session.userId),
+    authenticated,
     email: req.session?.email || null,
     role: req.session?.role || null,
-    needsFranchiseSelection: !!req.session?.userId && !req.session?.activeFranchiseId,
+    status,
+    pendingApproval: authenticated && status && status !== "approved",
+    needsFranchiseSelection: authenticated && status === "approved" && !req.session?.activeFranchiseId,
   });
-});
-
-// --- Forgot / reset password ---
-const email = require("./lib/email");
-
-const forgotLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5, // per IP
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many reset requests, please try again later" },
-});
-
-const resetLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-function hashToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-// Returns the public origin of this request so reset links point at the UI the
-// user came from. Falls back to host header.
-function originFromRequest(req) {
-  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
-  const host = req.headers["x-forwarded-host"] || req.get("host");
-  return `${proto}://${host}`;
-}
-
-// POST /api/forgot-password — always returns 200 to avoid leaking which emails
-// are registered. If the email exists, a one-hour token is emailed.
-app.post("/api/forgot-password", forgotLimiter, async (req, res) => {
-  const email_ = (req.body?.email || "").toLowerCase().trim();
-  if (!email_) return res.status(400).json({ error: "Email is required" });
-
-  const genericOk = { success: true, message: "If an account exists for that email, a reset link has been sent." };
-
-  try {
-    const { rows } = await db.query(
-      `SELECT id, email FROM users WHERE email = $1`,
-      [email_]
-    );
-    const user = rows[0];
-    if (!user) return res.json(genericOk);
-
-    // Invalidate any prior unused tokens for this user (optional — limits blast radius).
-    await db.query(
-      `UPDATE password_resets SET used_at = NOW()
-       WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()`,
-      [user.id]
-    );
-
-    const rawToken = crypto.randomBytes(32).toString("hex");
-    const tokenHash = hashToken(rawToken);
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-
-    await db.query(
-      `INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
-      [user.id, tokenHash, expiresAt]
-    );
-
-    const origin = originFromRequest(req);
-    const resetUrl = `${origin}/?reset=${rawToken}`;
-    const subject = "Reset your Reservation SMS Dashboard password";
-    const text =
-      `Someone requested a password reset for your account (${user.email}).\n\n` +
-      `If that was you, click this link within 1 hour to set a new password:\n` +
-      `${resetUrl}\n\n` +
-      `If you didn't request this, you can ignore this email — your password stays the same.`;
-    const html =
-      `<p>Someone requested a password reset for your account (<strong>${user.email}</strong>).</p>` +
-      `<p>If that was you, click the link below within 1 hour to set a new password:</p>` +
-      `<p><a href="${resetUrl}" style="background:#0ea5e9;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;">Reset password</a></p>` +
-      `<p style="font-size:12px;color:#666">Or copy this link: <br><code>${resetUrl}</code></p>` +
-      `<p style="font-size:12px;color:#666">If you didn't request this, you can ignore this email — your password stays the same.</p>`;
-
-    try {
-      await email.sendEmail({ to: user.email, subject, text, html });
-    } catch (mailErr) {
-      console.error("Reset email send failed:", mailErr.message);
-      // Don't reveal failure to the caller — the token is still valid and the
-      // link is in server logs for manual recovery if SMTP is misconfigured.
-    }
-
-    res.json(genericOk);
-  } catch (err) {
-    console.error("Forgot-password error:", err);
-    res.json(genericOk); // still return generic success shape
-  }
-});
-
-// POST /api/reset-password — redeem a token, set new password.
-app.post("/api/reset-password", resetLimiter, async (req, res) => {
-  const { token, password } = req.body || {};
-  if (!token || !password) return res.status(400).json({ error: "Token and password are required" });
-  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
-
-  try {
-    const tokenHash = hashToken(token);
-    const { rows } = await db.query(
-      `SELECT pr.id, pr.user_id, pr.expires_at, pr.used_at
-       FROM password_resets pr
-       WHERE pr.token_hash = $1`,
-      [tokenHash]
-    );
-    const reset = rows[0];
-    if (!reset) return res.status(400).json({ error: "Invalid or expired reset link" });
-    if (reset.used_at) return res.status(400).json({ error: "This reset link has already been used" });
-    if (new Date(reset.expires_at) < new Date()) return res.status(400).json({ error: "This reset link has expired" });
-
-    const hash = await bcrypt.hash(password, 12);
-    await db.withTx(async (c) => {
-      await c.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [hash, reset.user_id]);
-      await c.query(`UPDATE password_resets SET used_at = NOW() WHERE id = $1`, [reset.id]);
-    });
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Reset-password error:", err);
-    res.status(500).json({ error: "Failed to reset password" });
-  }
 });
 
 // GET /api/me — current user, active franchise, dock list, branding
@@ -368,6 +325,111 @@ app.post("/api/admin/switch-franchise", requireAuth, requireSuperAdmin, async (r
   if (!franchise) return res.status(404).json({ error: "Franchise not found" });
   req.session.activeFranchiseId = franchise.id;
   res.json({ success: true, franchise: { id: franchise.id, slug: franchise.slug, name: franchise.name } });
+});
+
+// --- Super-admin: user approvals ---
+const VALID_ROLES = ["super_admin", "franchise_admin", "franchise_staff"];
+
+app.get("/api/admin/users", requireAuth, requireSuperAdmin, async (req, res) => {
+  const status = req.query.status || null;
+  try {
+    const { rows } = await db.query(
+      `SELECT u.id, u.email, u.name, u.avatar_url, u.role, u.status,
+              u.franchise_id, f.name AS franchise_name,
+              u.created_at, u.last_login, u.approved_at
+         FROM users u
+         LEFT JOIN franchises f ON f.id = u.franchise_id
+        WHERE ($1::text IS NULL OR u.status = $1)
+        ORDER BY
+          CASE u.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1
+                       WHEN 'disabled' THEN 2 ELSE 3 END,
+          u.created_at DESC`,
+      [status]
+    );
+    res.json({ users: rows });
+  } catch (err) {
+    console.error("List users error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Approve a pending user. super_admin requires franchise_id = NULL;
+// franchise_admin/franchise_staff requires a valid franchise_id.
+app.post("/api/admin/users/:id/approve", requireAuth, requireSuperAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  const { role, franchiseId } = req.body || {};
+  if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: "Invalid role" });
+  const wantsFranchise = role !== "super_admin";
+  const fid = wantsFranchise ? parseInt(franchiseId, 10) : null;
+  if (wantsFranchise && !fid) return res.status(400).json({ error: "franchiseId required for this role" });
+
+  try {
+    if (fid) {
+      const f = await loadFranchise(fid);
+      if (!f) return res.status(404).json({ error: "Franchise not found" });
+    }
+    const { rows } = await db.query(
+      `UPDATE users
+          SET role = $1, franchise_id = $2, status = 'approved',
+              approved_at = NOW(), approved_by = $3
+        WHERE id = $4
+        RETURNING id, email, role, franchise_id, status`,
+      [role, fid, req.session.userId, targetId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true, user: rows[0] });
+  } catch (err) {
+    console.error("Approve user error:", err);
+    res.status(500).json({ error: err.message || "Failed to approve user" });
+  }
+});
+
+app.post("/api/admin/users/:id/reject", requireAuth, requireSuperAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (targetId === req.session.userId) return res.status(400).json({ error: "Cannot reject yourself" });
+  try {
+    const { rows } = await db.query(
+      `UPDATE users SET status = 'rejected' WHERE id = $1 RETURNING id, email, status`,
+      [targetId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true, user: rows[0] });
+  } catch (err) {
+    console.error("Reject user error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/admin/users/:id/disable", requireAuth, requireSuperAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (targetId === req.session.userId) return res.status(400).json({ error: "Cannot disable yourself" });
+  try {
+    const { rows } = await db.query(
+      `UPDATE users SET status = 'disabled' WHERE id = $1 RETURNING id, email, status`,
+      [targetId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "User not found" });
+    res.json({ success: true, user: rows[0] });
+  } catch (err) {
+    console.error("Disable user error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/admin/users/:id/reinstate", requireAuth, requireSuperAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  try {
+    const { rows } = await db.query(
+      `UPDATE users SET status = 'approved' WHERE id = $1 AND status IN ('disabled','rejected')
+       RETURNING id, email, status`,
+      [targetId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "User not found or already approved" });
+    res.json({ success: true, user: rows[0] });
+  } catch (err) {
+    console.error("Reinstate user error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 // --- Docks (scoped) ---

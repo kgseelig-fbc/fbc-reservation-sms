@@ -1,16 +1,16 @@
 #!/usr/bin/env node
-// Create a user. Role 'super_admin' has no franchise; 'franchise_admin' and
-// 'franchise_staff' must belong to a franchise.
+// Pre-approve a user by Google email. They'll sign in with Google and the
+// existing row gets linked. super_admin has no franchise; franchise_admin
+// and franchise_staff must belong to one.
 // Usage: node scripts/create-user.js
 
 require("dotenv").config();
-const bcrypt = require("bcryptjs");
 const db = require("../db");
-const { required, prompt } = require("./_prompt");
+const { required } = require("./_prompt");
 
 (async () => {
   try {
-    const email = (await required("Email: ")).toLowerCase();
+    const email = (await required("Email (Google): ")).toLowerCase();
 
     console.log("Roles: super_admin, franchise_admin, franchise_staff");
     const role = await required("Role: ");
@@ -32,15 +32,24 @@ const { required, prompt } = require("./_prompt");
       franchiseId = franchise.id;
     }
 
-    const password = await required("Password: ", { mask: true });
-    if (password.length < 8) { console.error("Password must be at least 8 characters."); process.exit(1); }
-    const hash = await bcrypt.hash(password, 12);
-
-    await db.query(
-      `INSERT INTO users (email, password_hash, role, franchise_id) VALUES ($1,$2,$3,$4)`,
-      [email, hash, role, franchiseId]
-    );
-    console.log(`User created: ${email} (${role}${franchiseId ? `, franchise_id=${franchiseId}` : ""})`);
+    const existing = await db.query(`SELECT id FROM users WHERE email = $1`, [email]);
+    if (existing.rows.length > 0) {
+      await db.query(
+        `UPDATE users
+            SET role = $1, franchise_id = $2, status = 'approved', approved_at = NOW()
+          WHERE id = $3`,
+        [role, franchiseId, existing.rows[0].id]
+      );
+      console.log(`User updated: ${email} (${role}${franchiseId ? `, franchise_id=${franchiseId}` : ""})`);
+    } else {
+      await db.query(
+        `INSERT INTO users (email, role, franchise_id, status, approved_at)
+         VALUES ($1, $2, $3, 'approved', NOW())`,
+        [email, role, franchiseId]
+      );
+      console.log(`User created: ${email} (${role}${franchiseId ? `, franchise_id=${franchiseId}` : ""})`);
+    }
+    console.log("They sign in with Google using this email — no password needed.");
   } catch (err) {
     if (err.code === "23505") console.error("That email is already registered.");
     else console.error("Failed:", err.message);

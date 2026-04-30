@@ -37,14 +37,8 @@ function setDocks(newDocks) {
 const api = {
   isLive: () => API_BASE.length > 0,
 
-  async login(email, password) {
-    const res = await fetch(`${API_BASE}/api/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      body: JSON.stringify({ email, password }),
-    });
-    return res.json();
+  startGoogleLogin() {
+    window.location.href = `${API_BASE}/api/auth/google`;
   },
 
   async me() {
@@ -67,20 +61,39 @@ const api = {
     return res.json();
   },
 
-  async forgotPassword(email) {
-    const res = await fetch(`${API_BASE}/api/forgot-password`, {
+  async listUsers(status) {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+    const res = await fetch(`${API_BASE}/api/admin/users${qs}`, { credentials: "same-origin" });
+    return res.json();
+  },
+
+  async approveUser(id, role, franchiseId) {
+    const res = await fetch(`${API_BASE}/api/admin/users/${id}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email }),
+      credentials: "same-origin",
+      body: JSON.stringify({ role, franchiseId }),
     });
     return res.json();
   },
 
-  async resetPassword(token, password) {
-    const res = await fetch(`${API_BASE}/api/reset-password`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token, password }),
+  async rejectUser(id) {
+    const res = await fetch(`${API_BASE}/api/admin/users/${id}/reject`, {
+      method: "POST", credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async disableUser(id) {
+    const res = await fetch(`${API_BASE}/api/admin/users/${id}/disable`, {
+      method: "POST", credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async reinstateUser(id) {
+    const res = await fetch(`${API_BASE}/api/admin/users/${id}/reinstate`, {
+      method: "POST", credentials: "same-origin",
     });
     return res.json();
   },
@@ -2381,6 +2394,18 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
                 fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
               }}
             >Automation</button>
+            {me && me.user && me.user.role === "super_admin" && (
+              <button
+                onClick={() => dispatch({ type: "SET_VIEW", payload: "users" })}
+                style={{
+                  padding: "10px 22px", borderRadius: 10, border: "none",
+                  background: state.view === "users" ? palette.dark : "transparent",
+                  color: state.view === "users" ? "#fff" : palette.muted,
+                  fontSize: 13, fontWeight: 600, cursor: "pointer",
+                  fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+                }}
+              >Users</button>
+            )}
             <button
               onClick={() => dispatch({ type: "SET_VIEW", payload: "upload" })}
               style={{
@@ -2502,6 +2527,8 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           </div>
         ) : state.view === "conversations" ? (
           <ConversationsPanel onOpen={(phone) => dispatch({ type: "OPEN_CONVERSATION", payload: phone })} />
+        ) : state.view === "users" && me && me.user && me.user.role === "super_admin" ? (
+          <UsersPanel palette={palette} />
         ) : state.view === "upload" || (state.view === "reservations" && state.reservations.length === 0) ? (
           <UploadPanel dispatch={(action) => {
             liveDispatch(action);
@@ -2706,296 +2733,350 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
   );
 }
 
-// --- Login Screen ---
-function LoginScreen({ onLogin, onForgotPassword }) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
+// --- Super-admin user management ---
+function UsersPanel({ palette }) {
+  const [users, setUsers] = useState([]);
+  const [franchises, setFranchises] = useState([]);
+  const [filter, setFilter] = useState("pending"); // pending | approved | rejected | disabled | all
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState(null);
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError("");
-    setLoading(true);
+  const reload = useCallback(async () => {
+    setLoading(true); setError("");
     try {
-      const result = await api.login(email, password);
-      if (result.success) {
-        onLogin(result);
-      } else {
-        setError(result.error || "Invalid email or password");
-      }
-    } catch (err) {
-      setError("Connection error. Please try again.");
+      const [u, f] = await Promise.all([
+        api.listUsers(filter === "all" ? null : filter),
+        api.listAllFranchises(),
+      ]);
+      setUsers(u.users || []);
+      setFranchises(f.franchises || []);
+    } catch {
+      setError("Failed to load users.");
     }
     setLoading(false);
-  };
+  }, [filter]);
+  useEffect(() => { reload(); }, [reload]);
+
+  const counts = users.reduce((acc, u) => { acc[u.status] = (acc[u.status] || 0) + 1; return acc; }, {});
+
+  return (
+    <div style={{ background: palette.card, borderRadius: 14, padding: 22, boxShadow: palette.shadow }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18, flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <h2 style={{ fontSize: 20, fontWeight: 700, color: palette.dark, fontFamily: "'Montserrat', sans-serif", margin: 0 }}>
+            Users &amp; access
+          </h2>
+          <p style={{ fontSize: 12, color: palette.muted, margin: "4px 0 0", fontFamily: "'Open Sans', sans-serif" }}>
+            Approve new sign-ins, assign their role and franchise, or disable existing users.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {["pending", "approved", "disabled", "rejected", "all"].map((f) => (
+            <button key={f} onClick={() => setFilter(f)} style={{
+              padding: "7px 14px", borderRadius: 8,
+              border: `1.5px solid ${filter === f ? palette.accent : palette.border}`,
+              background: filter === f ? palette.accentLight : "transparent",
+              color: filter === f ? palette.accent : palette.muted,
+              fontSize: 12, fontWeight: 600, cursor: "pointer",
+              fontFamily: "'Open Sans', sans-serif", textTransform: "capitalize",
+            }}>
+              {f} {f !== "all" && counts[f] != null ? `(${counts[f]})` : ""}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {error && <div style={{ color: "#dc2626", fontSize: 13, marginBottom: 12 }}>{error}</div>}
+      {loading ? (
+        <div style={{ color: palette.muted, fontSize: 13, padding: "40px 0", textAlign: "center" }}>Loading...</div>
+      ) : users.length === 0 ? (
+        <div style={{ color: palette.muted, fontSize: 13, padding: "40px 0", textAlign: "center" }}>
+          No users in this state.
+        </div>
+      ) : (
+        <div style={{ display: "grid", gap: 10 }}>
+          {users.map((u) => (
+            <UserRow
+              key={u.id}
+              user={u}
+              franchises={franchises}
+              palette={palette}
+              busy={busyId === u.id}
+              onApprove={async (role, fid) => {
+                setBusyId(u.id);
+                const r = await api.approveUser(u.id, role, fid);
+                setBusyId(null);
+                if (r.success) reload(); else alert(r.error || "Failed to approve");
+              }}
+              onReject={async () => {
+                if (!confirm(`Reject ${u.email}? They won't be able to sign in.`)) return;
+                setBusyId(u.id);
+                const r = await api.rejectUser(u.id);
+                setBusyId(null);
+                if (r.success) reload(); else alert(r.error || "Failed to reject");
+              }}
+              onDisable={async () => {
+                if (!confirm(`Disable ${u.email}? They'll lose access immediately.`)) return;
+                setBusyId(u.id);
+                const r = await api.disableUser(u.id);
+                setBusyId(null);
+                if (r.success) reload(); else alert(r.error || "Failed to disable");
+              }}
+              onReinstate={async () => {
+                setBusyId(u.id);
+                const r = await api.reinstateUser(u.id);
+                setBusyId(null);
+                if (r.success) reload(); else alert(r.error || "Failed to reinstate");
+              }}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UserRow({ user, franchises, palette, busy, onApprove, onReject, onDisable, onReinstate }) {
+  const [role, setRole] = useState(user.role || "franchise_staff");
+  const [fid, setFid] = useState(user.franchise_id ? String(user.franchise_id) : "");
+  const needsFranchise = role !== "super_admin";
+
+  const statusBadge = {
+    pending:  { bg: "#fef3c7", fg: "#92400e", label: "Pending" },
+    approved: { bg: "#d1fae5", fg: "#065f46", label: "Approved" },
+    rejected: { bg: "#fee2e2", fg: "#991b1b", label: "Rejected" },
+    disabled: { bg: "#e5e7eb", fg: "#374151", label: "Disabled" },
+  }[user.status] || { bg: "#e5e7eb", fg: "#374151", label: user.status };
 
   return (
     <div style={{
-      minHeight: "100vh",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
+      border: `1px solid ${palette.border}`, borderRadius: 10, padding: 14,
+      display: "grid", gridTemplateColumns: "minmax(220px, 1.4fr) minmax(360px, 2fr) auto",
+      gap: 14, alignItems: "center",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+        {user.avatar_url ? (
+          <img src={user.avatar_url} alt="" style={{ width: 36, height: 36, borderRadius: "50%" }} />
+        ) : (
+          <div style={{
+            width: 36, height: 36, borderRadius: "50%", background: palette.accentLight,
+            color: palette.accent, display: "flex", alignItems: "center", justifyContent: "center",
+            fontWeight: 700, fontSize: 14,
+          }}>{(user.name || user.email || "?").slice(0, 1).toUpperCase()}</div>
+        )}
+        <div style={{ minWidth: 0 }}>
+          <div style={{
+            fontSize: 13, fontWeight: 600, color: palette.dark,
+            fontFamily: "'Open Sans', sans-serif",
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          }}>{user.name || user.email}</div>
+          <div style={{
+            fontSize: 11, color: palette.muted,
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          }}>{user.email}</div>
+          <div style={{ marginTop: 4, display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={{
+              fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 999,
+              background: statusBadge.bg, color: statusBadge.fg,
+            }}>{statusBadge.label}</span>
+            {user.role && (
+              <span style={{ fontSize: 10, color: palette.muted }}>
+                {user.role}{user.franchise_name ? ` · ${user.franchise_name}` : ""}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {(user.status === "pending" || user.status === "approved") ? (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <select value={role} onChange={(e) => setRole(e.target.value)} disabled={busy} style={{
+            padding: "8px 10px", borderRadius: 8, border: `1px solid ${palette.border}`,
+            fontSize: 12, fontFamily: "'Open Sans', sans-serif",
+          }}>
+            <option value="super_admin">super_admin</option>
+            <option value="franchise_admin">franchise_admin</option>
+            <option value="franchise_staff">franchise_staff</option>
+          </select>
+          <select
+            value={needsFranchise ? fid : ""}
+            onChange={(e) => setFid(e.target.value)}
+            disabled={!needsFranchise || busy}
+            style={{
+              padding: "8px 10px", borderRadius: 8, border: `1px solid ${palette.border}`,
+              fontSize: 12, fontFamily: "'Open Sans', sans-serif",
+              opacity: needsFranchise ? 1 : 0.5,
+            }}
+          >
+            <option value="">{needsFranchise ? "Select franchise…" : "—"}</option>
+            {franchises.map((f) => (
+              <option key={f.id} value={f.id}>{f.name}</option>
+            ))}
+          </select>
+        </div>
+      ) : (
+        <div style={{ fontSize: 12, color: palette.muted }}>
+          {user.status === "rejected" ? "Sign-in blocked" : "Access disabled"}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+        {user.status === "pending" && (
+          <>
+            <button
+              disabled={busy || (needsFranchise && !fid)}
+              onClick={() => onApprove(role, needsFranchise ? parseInt(fid, 10) : null)}
+              style={{
+                padding: "8px 14px", borderRadius: 8, border: "none",
+                background: "#10b981", color: "#fff", fontSize: 12, fontWeight: 600,
+                cursor: busy ? "not-allowed" : "pointer", opacity: busy ? 0.6 : 1,
+                fontFamily: "'Open Sans', sans-serif",
+              }}
+            >Approve</button>
+            <button disabled={busy} onClick={onReject} style={{
+              padding: "8px 14px", borderRadius: 8, border: `1px solid ${palette.border}`,
+              background: "transparent", color: palette.muted, fontSize: 12, fontWeight: 600,
+              cursor: busy ? "not-allowed" : "pointer", fontFamily: "'Open Sans', sans-serif",
+            }}>Reject</button>
+          </>
+        )}
+        {user.status === "approved" && (
+          <>
+            <button
+              disabled={busy || (needsFranchise && !fid)}
+              onClick={() => onApprove(role, needsFranchise ? parseInt(fid, 10) : null)}
+              style={{
+                padding: "8px 14px", borderRadius: 8, border: `1px solid ${palette.border}`,
+                background: "transparent", color: palette.muted, fontSize: 12, fontWeight: 600,
+                cursor: busy ? "not-allowed" : "pointer", fontFamily: "'Open Sans', sans-serif",
+              }}
+            >Save</button>
+            <button disabled={busy} onClick={onDisable} style={{
+              padding: "8px 14px", borderRadius: 8, border: "none",
+              background: "#ef4444", color: "#fff", fontSize: 12, fontWeight: 600,
+              cursor: busy ? "not-allowed" : "pointer", fontFamily: "'Open Sans', sans-serif",
+            }}>Disable</button>
+          </>
+        )}
+        {(user.status === "rejected" || user.status === "disabled") && (
+          <button disabled={busy} onClick={onReinstate} style={{
+            padding: "8px 14px", borderRadius: 8, border: "none",
+            background: "#0ea5e9", color: "#fff", fontSize: 12, fontWeight: 600,
+            cursor: busy ? "not-allowed" : "pointer", fontFamily: "'Open Sans', sans-serif",
+          }}>Reinstate</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// --- Login Screen (Google SSO only) ---
+function LoginScreen({ ssoError }) {
+  const errMessage = (() => {
+    switch (ssoError) {
+      case "state":      return "Sign-in was interrupted. Please try again.";
+      case "verify":     return "Could not verify your Google account.";
+      case "unverified": return "Please verify your Google email before signing in.";
+      case "exchange":   return "Google sign-in failed. Please try again.";
+      default:           return ssoError ? "Sign-in failed. Please try again." : "";
+    }
+  })();
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
       background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
       fontFamily: "'Montserrat', sans-serif",
     }}>
-      <form onSubmit={handleSubmit} style={{
-        background: "rgba(255,255,255,0.07)",
-        backdropFilter: "blur(12px)",
-        borderRadius: 16,
-        padding: "48px 40px",
-        width: 380,
-        maxWidth: "90vw",
-        boxShadow: "0 8px 32px rgba(0,0,0,0.3)",
-        border: "1px solid rgba(255,255,255,0.1)",
+      <div style={{
+        background: "rgba(255,255,255,0.07)", backdropFilter: "blur(12px)",
+        borderRadius: 16, padding: "48px 40px", width: 380, maxWidth: "90vw",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)",
         textAlign: "center",
       }}>
         <img src={FBC_LOGO} alt="FBC Logo" style={{ width: 80, height: 80, borderRadius: "50%", objectFit: "contain", marginBottom: 20, filter: "drop-shadow(0 4px 12px rgba(0,0,0,0.3))" }} />
         <h1 style={{ color: "#fff", fontSize: 22, marginBottom: 8, fontWeight: 700 }}>
           Reservation SMS Dashboard
         </h1>
-        <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginBottom: 32 }}>
-          Sign in to continue
+        <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginBottom: 28 }}>
+          Sign in with your Google account
         </p>
-        {error && (
-          <div style={{
-            background: "rgba(239,68,68,0.15)",
-            border: "1px solid rgba(239,68,68,0.3)",
-            color: "#fca5a5",
-            borderRadius: 8,
-            padding: "10px 14px",
-            fontSize: 13,
-            marginBottom: 16,
-          }}>{error}</div>
-        )}
-        <input
-          type="email"
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          autoFocus
-          autoComplete="username"
-          style={{
-            width: "100%",
-            padding: "12px 16px",
-            borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.15)",
-            background: "rgba(255,255,255,0.08)",
-            color: "#fff",
-            fontSize: 15,
-            outline: "none",
-            marginBottom: 12,
-            boxSizing: "border-box",
-          }}
-        />
-        <input
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          autoComplete="current-password"
-          style={{
-            width: "100%",
-            padding: "12px 16px",
-            borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.15)",
-            background: "rgba(255,255,255,0.08)",
-            color: "#fff",
-            fontSize: 15,
-            outline: "none",
-            marginBottom: 20,
-            boxSizing: "border-box",
-          }}
-        />
-        <button
-          type="submit"
-          disabled={loading || !email || !password}
-          style={{
-            width: "100%",
-            padding: "12px 0",
-            borderRadius: 8,
-            border: "none",
-            background: loading ? "#555" : "linear-gradient(135deg, #0ea5e9, #2563eb)",
-            color: "#fff",
-            fontSize: 15,
-            fontWeight: 600,
-            cursor: loading ? "not-allowed" : "pointer",
-          }}
-        >
-          {loading ? "Signing in..." : "Sign In"}
-        </button>
-        <button
-          type="button"
-          onClick={onForgotPassword}
-          style={{
-            marginTop: 14, background: "transparent", border: "none",
-            color: "rgba(255,255,255,0.55)", fontSize: 12, cursor: "pointer",
-            fontFamily: "inherit",
-          }}
-        >Forgot password?</button>
-      </form>
-    </div>
-  );
-}
-
-// --- Forgot password (email submission) ---
-function ForgotPasswordScreen({ onBack }) {
-  const [email, setEmail] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [sent, setSent] = useState(false);
-  const [error, setError] = useState("");
-
-  const submit = async (e) => {
-    e.preventDefault();
-    setError(""); setLoading(true);
-    try {
-      const r = await api.forgotPassword(email);
-      if (r.success) setSent(true);
-      else setError(r.error || "Something went wrong");
-    } catch {
-      setError("Connection error. Please try again.");
-    }
-    setLoading(false);
-  };
-
-  return (
-    <div style={{
-      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
-      background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
-      fontFamily: "'Montserrat', sans-serif",
-    }}>
-      <form onSubmit={submit} style={{
-        background: "rgba(255,255,255,0.07)", backdropFilter: "blur(12px)",
-        borderRadius: 16, padding: "48px 40px", width: 380, maxWidth: "90vw",
-        boxShadow: "0 8px 32px rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)",
-        textAlign: "center",
-      }}>
-        <h1 style={{ color: "#fff", fontSize: 20, marginBottom: 8, fontWeight: 700 }}>Reset your password</h1>
-        {sent ? (
-          <>
-            <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, marginBottom: 20, lineHeight: 1.6 }}>
-              If an account exists for <strong>{email}</strong>, a reset link has been sent.
-              Check your inbox — the link expires in 1 hour.
-            </p>
-            <button type="button" onClick={onBack} style={{
-              width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
-              background: "linear-gradient(135deg, #0ea5e9, #2563eb)", color: "#fff",
-              fontSize: 14, fontWeight: 600, cursor: "pointer",
-            }}>Back to sign in</button>
-          </>
-        ) : (
-          <>
-            <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginBottom: 24 }}>
-              We'll email you a link to set a new password.
-            </p>
-            {error && (
-              <div style={{
-                background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)",
-                color: "#fca5a5", borderRadius: 8, padding: "10px 14px",
-                fontSize: 13, marginBottom: 16,
-              }}>{error}</div>
-            )}
-            <input
-              type="email" placeholder="Email" value={email} autoFocus required
-              onChange={(e) => setEmail(e.target.value)}
-              style={{
-                width: "100%", padding: "12px 16px", borderRadius: 8,
-                border: "1px solid rgba(255,255,255,0.15)",
-                background: "rgba(255,255,255,0.08)", color: "#fff",
-                fontSize: 15, outline: "none", marginBottom: 16, boxSizing: "border-box",
-              }}
-            />
-            <button type="submit" disabled={loading || !email} style={{
-              width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
-              background: loading ? "#555" : "linear-gradient(135deg, #0ea5e9, #2563eb)",
-              color: "#fff", fontSize: 15, fontWeight: 600,
-              cursor: loading ? "not-allowed" : "pointer",
-            }}>{loading ? "Sending..." : "Send reset link"}</button>
-            <button type="button" onClick={onBack} style={{
-              marginTop: 14, background: "transparent", border: "none",
-              color: "rgba(255,255,255,0.55)", fontSize: 12, cursor: "pointer",
-              fontFamily: "inherit",
-            }}>← Back to sign in</button>
-          </>
-        )}
-      </form>
-    </div>
-  );
-}
-
-// --- Reset password (entered from email link with ?reset=TOKEN) ---
-function ResetPasswordScreen({ token, onComplete }) {
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  const submit = async (e) => {
-    e.preventDefault();
-    setError("");
-    if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
-    if (password !== confirm) { setError("Passwords don't match."); return; }
-    setLoading(true);
-    try {
-      const r = await api.resetPassword(token, password);
-      if (r.success) onComplete();
-      else setError(r.error || "Could not reset password");
-    } catch {
-      setError("Connection error. Please try again.");
-    }
-    setLoading(false);
-  };
-
-  return (
-    <div style={{
-      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
-      background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
-      fontFamily: "'Montserrat', sans-serif",
-    }}>
-      <form onSubmit={submit} style={{
-        background: "rgba(255,255,255,0.07)", backdropFilter: "blur(12px)",
-        borderRadius: 16, padding: "48px 40px", width: 380, maxWidth: "90vw",
-        boxShadow: "0 8px 32px rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)",
-        textAlign: "center",
-      }}>
-        <h1 style={{ color: "#fff", fontSize: 20, marginBottom: 8, fontWeight: 700 }}>Set a new password</h1>
-        <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 13, marginBottom: 24 }}>
-          At least 8 characters.
-        </p>
-        {error && (
+        {errMessage && (
           <div style={{
             background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)",
             color: "#fca5a5", borderRadius: 8, padding: "10px 14px",
             fontSize: 13, marginBottom: 16,
-          }}>{error}</div>
+          }}>{errMessage}</div>
         )}
-        <input
-          type="password" placeholder="New password" value={password} autoFocus required
-          autoComplete="new-password" onChange={(e) => setPassword(e.target.value)}
+        <button
+          type="button"
+          onClick={() => api.startGoogleLogin()}
           style={{
-            width: "100%", padding: "12px 16px", borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.15)",
-            background: "rgba(255,255,255,0.08)", color: "#fff",
-            fontSize: 15, outline: "none", marginBottom: 12, boxSizing: "border-box",
+            width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
+            background: "#fff", color: "#1f2937", fontSize: 15, fontWeight: 600,
+            cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+            gap: 10, fontFamily: "inherit",
           }}
-        />
-        <input
-          type="password" placeholder="Confirm new password" value={confirm} required
-          autoComplete="new-password" onChange={(e) => setConfirm(e.target.value)}
-          style={{
-            width: "100%", padding: "12px 16px", borderRadius: 8,
-            border: "1px solid rgba(255,255,255,0.15)",
-            background: "rgba(255,255,255,0.08)", color: "#fff",
-            fontSize: 15, outline: "none", marginBottom: 20, boxSizing: "border-box",
-          }}
-        />
-        <button type="submit" disabled={loading || !password || !confirm} style={{
-          width: "100%", padding: "12px 0", borderRadius: 8, border: "none",
-          background: loading ? "#555" : "linear-gradient(135deg, #0ea5e9, #2563eb)",
-          color: "#fff", fontSize: 15, fontWeight: 600,
-          cursor: loading ? "not-allowed" : "pointer",
-        }}>{loading ? "Updating..." : "Update password"}</button>
-      </form>
+        >
+          <svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+            <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/>
+            <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/>
+            <path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z"/>
+            <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/>
+          </svg>
+          Sign in with Google
+        </button>
+        <p style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, marginTop: 18, lineHeight: 1.5 }}>
+          New accounts require approval before access is granted.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// --- Pending approval screen ---
+function PendingApprovalScreen({ session, onLogout }) {
+  const status = session?.status || "pending";
+  const title = status === "rejected" ? "Access denied"
+    : status === "disabled" ? "Account disabled"
+    : "Awaiting approval";
+  const message = status === "rejected"
+    ? "Your access request was declined. Contact your administrator if you believe this is a mistake."
+    : status === "disabled"
+    ? "Your account has been disabled. Contact your administrator to restore access."
+    : "Thanks for signing in. An administrator needs to approve your account before you can access the dashboard. You'll get access as soon as they review it.";
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
+      fontFamily: "'Montserrat', sans-serif",
+    }}>
+      <div style={{
+        background: "rgba(255,255,255,0.07)", backdropFilter: "blur(12px)",
+        borderRadius: 16, padding: "48px 40px", width: 420, maxWidth: "90vw",
+        boxShadow: "0 8px 32px rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.1)",
+        textAlign: "center", color: "#fff",
+      }}>
+        <div style={{ fontSize: 40, marginBottom: 12 }}>
+          {status === "rejected" || status === "disabled" ? "⛔" : "⏳"}
+        </div>
+        <h1 style={{ fontSize: 22, marginBottom: 12, fontWeight: 700 }}>{title}</h1>
+        <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 14, lineHeight: 1.6, marginBottom: 12 }}>
+          {message}
+        </p>
+        {session?.email && (
+          <p style={{ color: "rgba(255,255,255,0.5)", fontSize: 12, marginBottom: 24 }}>
+            Signed in as <strong>{session.email}</strong>
+          </p>
+        )}
+        <button onClick={onLogout} style={{
+          padding: "10px 24px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.2)",
+          background: "transparent", color: "#fff", fontSize: 13, fontWeight: 600,
+          cursor: "pointer", fontFamily: "inherit",
+        }}>Sign out</button>
+      </div>
     </div>
   );
 }
@@ -3051,22 +3132,25 @@ function FranchisePickerScreen({ onPicked, onLogout }) {
 
 // --- App Wrapper with Auth Gate ---
 function App() {
-  const [authState, setAuthState] = useState("checking"); // checking | anon | needsFranchise | authed
+  const [authState, setAuthState] = useState("checking"); // checking | anon | pending | needsFranchise | authed
   const [me, setMe] = useState(null);
-  const [screen, setScreen] = useState("login"); // login | forgot
-  // Check for ?reset=TOKEN in the URL. If present, override everything and
-  // show the password reset form until the user completes or navigates away.
-  const [resetToken, setResetToken] = useState(() => {
+  const [session, setSession] = useState(null);
+  const [ssoError] = useState(() => {
     const params = new URLSearchParams(window.location.search);
-    return params.get("reset");
+    const err = params.get("sso_error");
+    if (err) {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    return err;
   });
-  const [resetDone, setResetDone] = useState(false);
 
   const bootstrap = useCallback(async () => {
     try {
-      const session = await api.checkSession();
-      if (!session.authenticated) { setAuthState("anon"); return; }
-      if (session.needsFranchiseSelection) { setAuthState("needsFranchise"); return; }
+      const s = await api.checkSession();
+      setSession(s);
+      if (!s.authenticated) { setAuthState("anon"); return; }
+      if (s.pendingApproval) { setAuthState("pending"); return; }
+      if (s.needsFranchiseSelection) { setAuthState("needsFranchise"); return; }
       const meData = await api.me();
       setDocks(meData.docks || []);
       setMe(meData);
@@ -3076,48 +3160,14 @@ function App() {
     }
   }, []);
 
-  useEffect(() => { if (!resetToken) bootstrap(); else setAuthState("anon"); }, [bootstrap, resetToken]);
+  useEffect(() => { bootstrap(); }, [bootstrap]);
 
   const handleLogout = async () => {
     try { await api.logout(); } catch {}
     setMe(null);
+    setSession(null);
     setAuthState("anon");
-    setScreen("login");
   };
-
-  // Reset-password flow (triggered by email link with ?reset=TOKEN)
-  if (resetToken && !resetDone) {
-    return (
-      <ResetPasswordScreen
-        token={resetToken}
-        onComplete={() => {
-          setResetDone(true);
-          setResetToken(null);
-          // Strip the token from the URL so it's not bookmarked or re-used
-          window.history.replaceState({}, "", window.location.pathname);
-        }}
-      />
-    );
-  }
-  if (resetDone) {
-    // Brief confirmation → fall through to login
-    return (
-      <div style={{
-        minHeight: "100vh", display: "flex", flexDirection: "column",
-        alignItems: "center", justifyContent: "center", gap: 20,
-        background: "linear-gradient(135deg, #0f2027, #203a43, #2c5364)",
-        fontFamily: "'Montserrat', sans-serif", color: "#fff",
-      }}>
-        <div style={{ fontSize: 40 }}>✓</div>
-        <h1 style={{ fontSize: 20, fontWeight: 700 }}>Password updated</h1>
-        <button onClick={() => setResetDone(false)} style={{
-          padding: "12px 28px", borderRadius: 8, border: "none",
-          background: "linear-gradient(135deg, #0ea5e9, #2563eb)", color: "#fff",
-          fontSize: 14, fontWeight: 600, cursor: "pointer",
-        }}>Sign in</button>
-      </div>
-    );
-  }
 
   if (authState === "checking") {
     return (
@@ -3128,10 +3178,8 @@ function App() {
       }}>Loading...</div>
     );
   }
-  if (authState === "anon") {
-    if (screen === "forgot") return <ForgotPasswordScreen onBack={() => setScreen("login")} />;
-    return <LoginScreen onLogin={bootstrap} onForgotPassword={() => setScreen("forgot")} />;
-  }
+  if (authState === "anon") return <LoginScreen ssoError={ssoError} />;
+  if (authState === "pending") return <PendingApprovalScreen session={session} onLogout={handleLogout} />;
   if (authState === "needsFranchise") return <FranchisePickerScreen onPicked={bootstrap} onLogout={handleLogout} />;
   return <ReservationDashboard onLogout={handleLogout} me={me} onFranchiseChanged={bootstrap} />;
 }
