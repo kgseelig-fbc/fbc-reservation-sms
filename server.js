@@ -76,7 +76,10 @@ app.use(session({
   cookie: {
     httpOnly: true,
     secure: isProduction,
-    sameSite: "strict",
+    // 'lax' (not 'strict') so the session cookie survives the top-level
+    // redirect from accounts.google.com back to /api/auth/google/callback —
+    // 'strict' drops the cookie on any cross-site navigation, breaking OAuth.
+    sameSite: "lax",
     maxAge: 8 * 60 * 60 * 1000,
   },
 }));
