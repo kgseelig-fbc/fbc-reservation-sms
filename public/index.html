@@ -2193,8 +2193,10 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
 
     const checkHealth = async () => {
       try {
-        const data = await api.healthCheck();
-        if (active) setApiStatus(data.twilioConfigured ? "connected" : "connected-no-twilio");
+        await api.healthCheck();
+        // Twilio config is per-franchise now, so read it from /api/me's franchise
+        // payload rather than the (single-tenant) health endpoint.
+        if (active) setApiStatus(me?.franchise?.twilioConfigured ? "connected" : "connected-no-twilio");
       } catch {
         if (active) setApiStatus("error");
       }
@@ -2218,7 +2220,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
 
     const interval = setInterval(poll, 5000);
     return () => { active = false; clearInterval(interval); };
-  }, [state.currentDock]);
+  }, [state.currentDock, me?.franchise?.twilioConfigured]);
 
   const filtered = state.reservations
     .filter((r) => state.filter === "all" || r.status === state.filter)
