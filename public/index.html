@@ -98,6 +98,62 @@ const api = {
     return res.json();
   },
 
+  async submitFeedback(payload) {
+    const res = await fetch(`${API_BASE}/api/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(payload),
+    });
+    return res.json();
+  },
+
+  async myFeedback() {
+    const res = await fetch(`${API_BASE}/api/me/feedback`, { credentials: "same-origin" });
+    return res.json();
+  },
+
+  async knownIssues() {
+    const res = await fetch(`${API_BASE}/api/known-issues`, { credentials: "same-origin" });
+    return res.json();
+  },
+
+  async adminListFeedback(status) {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+    const res = await fetch(`${API_BASE}/api/admin/feedback${qs}`, { credentials: "same-origin" });
+    return res.json();
+  },
+
+  async adminFeedbackStatus(id, status) {
+    const res = await fetch(`${API_BASE}/api/admin/feedback/${id}/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ status }),
+    });
+    return res.json();
+  },
+
+  async adminFeedbackReply(id, reply) {
+    const res = await fetch(`${API_BASE}/api/admin/feedback/${id}/reply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ reply }),
+    });
+    return res.json();
+  },
+
+  async adminFeedbackPin(id, pin) {
+    const res = await fetch(`${API_BASE}/api/admin/feedback/${id}/pin`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ pin }),
+    });
+    return res.json();
+  },
+
   async logout() {
     const res = await fetch(`${API_BASE}/api/logout`, {
       method: "POST",
@@ -2406,6 +2462,18 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
                 }}
               >Users</button>
             )}
+            {me && me.user && me.user.role === "super_admin" && (
+              <button
+                onClick={() => dispatch({ type: "SET_VIEW", payload: "feedback" })}
+                style={{
+                  padding: "10px 22px", borderRadius: 10, border: "none",
+                  background: state.view === "feedback" ? palette.dark : "transparent",
+                  color: state.view === "feedback" ? "#fff" : palette.muted,
+                  fontSize: 13, fontWeight: 600, cursor: "pointer",
+                  fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+                }}
+              >Feedback</button>
+            )}
             <button
               onClick={() => dispatch({ type: "SET_VIEW", payload: "upload" })}
               style={{
@@ -2529,6 +2597,8 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           <ConversationsPanel onOpen={(phone) => dispatch({ type: "OPEN_CONVERSATION", payload: phone })} />
         ) : state.view === "users" && me && me.user && me.user.role === "super_admin" ? (
           <UsersPanel palette={palette} />
+        ) : state.view === "feedback" && me && me.user && me.user.role === "super_admin" ? (
+          <AdminFeedbackPanel palette={palette} />
         ) : state.view === "upload" || (state.view === "reservations" && state.reservations.length === 0) ? (
           <UploadPanel dispatch={(action) => {
             liveDispatch(action);
@@ -2728,6 +2798,288 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           dispatch={dispatch}
           onSend={liveDispatch}
         />
+      )}
+      <FeedbackWidget palette={palette} dock={state.currentDock} view={state.view} />
+    </>
+  );
+}
+
+// --- Floating feedback widget (visible to every approved user) ---
+function FeedbackWidget({ palette, dock, view }) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState("submit"); // submit | mine | known
+  const [category, setCategory] = useState("bug");
+  const [message, setMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const [status, setStatus] = useState({ text: "", type: "" });
+  const [mine, setMine] = useState([]);
+  const [known, setKnown] = useState([]);
+  const [loadingList, setLoadingList] = useState(false);
+
+  const loadMine = useCallback(async () => {
+    setLoadingList(true);
+    try {
+      const r = await api.myFeedback();
+      setMine(r.feedback || []);
+    } catch { setMine([]); }
+    setLoadingList(false);
+  }, []);
+
+  const loadKnown = useCallback(async () => {
+    setLoadingList(true);
+    try {
+      const r = await api.knownIssues();
+      setKnown(r.issues || []);
+    } catch { setKnown([]); }
+    setLoadingList(false);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    if (tab === "mine") loadMine();
+    if (tab === "known") loadKnown();
+  }, [open, tab, loadMine, loadKnown]);
+
+  const submit = async () => {
+    const trimmed = message.trim();
+    if (trimmed.length < 3) {
+      setStatus({ text: "Please add a short description.", type: "err" });
+      return;
+    }
+    setSending(true);
+    setStatus({ text: "Sending…", type: "" });
+    try {
+      const r = await api.submitFeedback({
+        category,
+        message: trimmed,
+        context: { page_url: window.location.pathname, dock: dock || null, view: view || null },
+      });
+      if (r.success) {
+        setStatus({ text: "Thanks — feedback received.", type: "ok" });
+        setMessage("");
+        setTimeout(() => { setOpen(false); setStatus({ text: "", type: "" }); }, 1200);
+      } else {
+        setStatus({ text: r.error || "Failed to send.", type: "err" });
+      }
+    } catch {
+      setStatus({ text: "Network error. Try again.", type: "err" });
+    }
+    setSending(false);
+  };
+
+  const fmtTime = (ts) => {
+    if (!ts) return "";
+    const d = new Date(ts);
+    const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+    if (diff < 60) return "just now";
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    return d.toLocaleDateString();
+  };
+
+  const statusPill = (s) => {
+    const cfg = {
+      new:         { bg: "#fef3c7", fg: "#92400e", label: "New" },
+      in_progress: { bg: "#dbeafe", fg: "#1e40af", label: "In progress" },
+      resolved:    { bg: "#d1fae5", fg: "#065f46", label: "Resolved" },
+      wont_fix:    { bg: "#e5e7eb", fg: "#374151", label: "Won't fix" },
+    }[s] || { bg: "#e5e7eb", fg: "#374151", label: s };
+    return (
+      <span style={{
+        fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 999,
+        background: cfg.bg, color: cfg.fg,
+      }}>{cfg.label}</span>
+    );
+  };
+
+  const renderItem = (r, opts = {}) => (
+    <div key={r.id} style={{
+      border: `1px solid ${palette.border}`, borderRadius: 10, padding: 12,
+      background: "#fff",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+        {statusPill(r.status)}
+        {!opts.hideCategory && (
+          <span style={{
+            fontSize: 10, fontWeight: 600, color: palette.muted,
+            textTransform: "uppercase", letterSpacing: 0.5,
+          }}>{r.category}</span>
+        )}
+        <span style={{ fontSize: 11, color: palette.muted, marginLeft: "auto" }}>
+          {fmtTime(r.ts)}{r.resolved_at ? ` · resolved ${fmtTime(r.resolved_at)}` : ""}
+        </span>
+      </div>
+      <div style={{ fontSize: 13, color: palette.dark, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+        {r.message}
+      </div>
+      {r.admin_reply && (
+        <div style={{
+          marginTop: 8, padding: 10, borderRadius: 8,
+          background: palette.accentLight, borderLeft: `3px solid ${palette.accent}`,
+        }}>
+          <div style={{
+            fontSize: 10, fontWeight: 700, color: palette.accent,
+            textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4,
+          }}>Note from admin</div>
+          <div style={{ fontSize: 13, color: palette.dark, whiteSpace: "pre-wrap" }}>
+            {r.admin_reply}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <>
+      <button
+        onClick={() => setOpen(true)}
+        title="Feedback"
+        aria-label="Feedback"
+        style={{
+          position: "fixed", right: 24, bottom: 24, zIndex: 50,
+          width: 52, height: 52, borderRadius: "50%", border: "none",
+          background: palette.dark, color: "#fff", fontSize: 22,
+          cursor: "pointer", boxShadow: "0 8px 24px rgba(0,0,0,0.25)",
+          fontFamily: "inherit",
+        }}
+      >💬</button>
+
+      {open && (
+        <div
+          onClick={() => setOpen(false)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 60,
+            background: "rgba(15,23,42,0.45)", display: "flex",
+            alignItems: "flex-end", justifyContent: "flex-end", padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 420, maxWidth: "100%", maxHeight: "85vh",
+              background: palette.card, borderRadius: 14, boxShadow: palette.shadowHover,
+              display: "flex", flexDirection: "column", overflow: "hidden",
+              fontFamily: "'Open Sans', sans-serif",
+            }}
+          >
+            <div style={{
+              padding: "14px 18px", borderBottom: `1px solid ${palette.border}`,
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+            }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: palette.dark, fontFamily: "'Montserrat', sans-serif" }}>
+                💬 Feedback
+              </div>
+              <button onClick={() => setOpen(false)} style={{
+                background: "transparent", border: "none", color: palette.muted,
+                fontSize: 18, cursor: "pointer", lineHeight: 1,
+              }}>×</button>
+            </div>
+
+            <div style={{ display: "flex", borderBottom: `1px solid ${palette.border}` }}>
+              {[
+                { id: "submit", label: "Submit" },
+                { id: "mine",   label: "My reports" },
+                { id: "known",  label: "Known issues" },
+              ].map((t) => (
+                <button key={t.id} onClick={() => setTab(t.id)} style={{
+                  flex: 1, padding: "10px 0", border: "none",
+                  background: tab === t.id ? palette.accentLight : "transparent",
+                  color: tab === t.id ? palette.accent : palette.muted,
+                  fontSize: 12, fontWeight: 600, cursor: "pointer",
+                  fontFamily: "inherit", borderBottom: tab === t.id ? `2px solid ${palette.accent}` : "2px solid transparent",
+                }}>{t.label}</button>
+              ))}
+            </div>
+
+            <div style={{ padding: 16, overflowY: "auto" }}>
+              {tab === "submit" && (
+                <>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: palette.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>Type</div>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+                    {[
+                      { id: "bug",         label: "Bug / error" },
+                      { id: "feedback",    label: "Feedback" },
+                      { id: "enhancement", label: "Enhancement" },
+                    ].map((c) => (
+                      <button key={c.id} onClick={() => setCategory(c.id)} style={{
+                        flex: 1, padding: "8px 10px", borderRadius: 8,
+                        border: `1.5px solid ${category === c.id ? palette.accent : palette.border}`,
+                        background: category === c.id ? palette.accentLight : "transparent",
+                        color: category === c.id ? palette.accent : palette.muted,
+                        fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+                      }}>{c.label}</button>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: palette.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>Details</div>
+                  <textarea
+                    value={message}
+                    onChange={(e) => setMessage(e.target.value)}
+                    rows={5}
+                    maxLength={4000}
+                    placeholder="What happened, what you expected, or what would help…"
+                    style={{
+                      width: "100%", padding: "10px 12px", borderRadius: 8,
+                      border: `1px solid ${palette.border}`, fontSize: 13,
+                      fontFamily: "inherit", boxSizing: "border-box", resize: "vertical",
+                    }}
+                  />
+                  <div style={{ fontSize: 11, color: palette.muted, marginTop: 6 }}>
+                    Page: {window.location.pathname}{dock ? ` · Dock: ${dock}` : ""}{view ? ` · View: ${view}` : ""}
+                  </div>
+                  {status.text && (
+                    <div style={{
+                      marginTop: 10, fontSize: 12,
+                      color: status.type === "err" ? "#dc2626" : status.type === "ok" ? "#059669" : palette.muted,
+                    }}>{status.text}</div>
+                  )}
+                  <div style={{ display: "flex", gap: 8, marginTop: 14, justifyContent: "flex-end" }}>
+                    <button onClick={() => setOpen(false)} style={{
+                      padding: "8px 14px", borderRadius: 8, border: `1px solid ${palette.border}`,
+                      background: "transparent", color: palette.muted, fontSize: 12, fontWeight: 600,
+                      cursor: "pointer", fontFamily: "inherit",
+                    }}>Cancel</button>
+                    <button
+                      onClick={submit}
+                      disabled={sending || message.trim().length < 3}
+                      style={{
+                        padding: "8px 18px", borderRadius: 8, border: "none",
+                        background: sending ? "#94a3b8" : palette.dark, color: "#fff",
+                        fontSize: 12, fontWeight: 600,
+                        cursor: sending || message.trim().length < 3 ? "not-allowed" : "pointer",
+                        fontFamily: "inherit",
+                        opacity: message.trim().length < 3 ? 0.5 : 1,
+                      }}
+                    >{sending ? "Sending…" : "Send"}</button>
+                  </div>
+                </>
+              )}
+
+              {tab === "mine" && (
+                <div style={{ display: "grid", gap: 8 }}>
+                  {loadingList ? (
+                    <div style={{ color: palette.muted, fontSize: 13, textAlign: "center", padding: 20 }}>Loading…</div>
+                  ) : mine.length === 0 ? (
+                    <div style={{ color: palette.muted, fontSize: 13, textAlign: "center", padding: 20 }}>
+                      You haven't submitted anything yet.
+                    </div>
+                  ) : mine.map((r) => renderItem(r))}
+                </div>
+              )}
+
+              {tab === "known" && (
+                <div style={{ display: "grid", gap: 8 }}>
+                  {loadingList ? (
+                    <div style={{ color: palette.muted, fontSize: 13, textAlign: "center", padding: 20 }}>Loading…</div>
+                  ) : known.length === 0 ? (
+                    <div style={{ color: palette.muted, fontSize: 13, textAlign: "center", padding: 20 }}>
+                      No known issues right now.
+                    </div>
+                  ) : known.map((r) => renderItem(r, { hideCategory: true }))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </>
   );
@@ -2967,6 +3319,224 @@ function UserRow({ user, franchises, palette, busy, onApprove, onReject, onDisab
           }}>Reinstate</button>
         )}
       </div>
+    </div>
+  );
+}
+
+// --- Super-admin feedback triage ---
+function AdminFeedbackPanel({ palette }) {
+  const [items, setItems] = useState([]);
+  const [filter, setFilter] = useState("open"); // open | new | in_progress | resolved | wont_fix | all
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [busyId, setBusyId] = useState(null);
+  const [drafts, setDrafts] = useState({}); // id -> draft reply
+
+  const reload = useCallback(async () => {
+    setLoading(true); setError("");
+    try {
+      const wire = filter === "open" || filter === "all" ? null : filter;
+      const r = await api.adminListFeedback(wire);
+      let rows = r.feedback || [];
+      if (filter === "open") rows = rows.filter((f) => f.status === "new" || f.status === "in_progress");
+      setItems(rows);
+    } catch {
+      setError("Failed to load feedback.");
+    }
+    setLoading(false);
+  }, [filter]);
+  useEffect(() => { reload(); }, [reload]);
+
+  const counts = items.reduce((acc, f) => { acc[f.status] = (acc[f.status] || 0) + 1; return acc; }, {});
+
+  const handleStatus = async (id, status) => {
+    setBusyId(id);
+    const r = await api.adminFeedbackStatus(id, status);
+    setBusyId(null);
+    if (r.success) reload(); else alert(r.error || "Failed to update status");
+  };
+  const handlePin = async (id, pin) => {
+    setBusyId(id);
+    const r = await api.adminFeedbackPin(id, pin);
+    setBusyId(null);
+    if (r.success) reload(); else alert(r.error || "Failed to update pin");
+  };
+  const handleReply = async (id) => {
+    setBusyId(id);
+    const r = await api.adminFeedbackReply(id, drafts[id] || "");
+    setBusyId(null);
+    if (r.success) {
+      setDrafts((d) => { const next = { ...d }; delete next[id]; return next; });
+      reload();
+    } else {
+      alert(r.error || "Failed to save reply");
+    }
+  };
+
+  const fmtTime = (ts) => {
+    if (!ts) return "";
+    const d = new Date(ts);
+    return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  };
+
+  const statusColors = {
+    new:         { bg: "#fef3c7", fg: "#92400e" },
+    in_progress: { bg: "#dbeafe", fg: "#1e40af" },
+    resolved:    { bg: "#d1fae5", fg: "#065f46" },
+    wont_fix:    { bg: "#e5e7eb", fg: "#374151" },
+  };
+
+  return (
+    <div style={{ background: palette.card, borderRadius: 14, padding: 22, boxShadow: palette.shadow }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18, flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <h2 style={{ fontSize: 20, fontWeight: 700, color: palette.dark, fontFamily: "'Montserrat', sans-serif", margin: 0 }}>
+            Feedback &amp; bug reports
+          </h2>
+          <p style={{ fontSize: 12, color: palette.muted, margin: "4px 0 0", fontFamily: "'Open Sans', sans-serif" }}>
+            Triage submissions, reply to the user, and pin items as known issues.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {["open", "new", "in_progress", "resolved", "wont_fix", "all"].map((f) => (
+            <button key={f} onClick={() => setFilter(f)} style={{
+              padding: "7px 14px", borderRadius: 8,
+              border: `1.5px solid ${filter === f ? palette.accent : palette.border}`,
+              background: filter === f ? palette.accentLight : "transparent",
+              color: filter === f ? palette.accent : palette.muted,
+              fontSize: 12, fontWeight: 600, cursor: "pointer",
+              fontFamily: "'Open Sans', sans-serif", textTransform: "capitalize",
+            }}>
+              {f.replace("_", " ")} {counts[f] != null ? `(${counts[f]})` : ""}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {error && <div style={{ color: "#dc2626", fontSize: 13, marginBottom: 12 }}>{error}</div>}
+      {loading ? (
+        <div style={{ color: palette.muted, fontSize: 13, padding: "40px 0", textAlign: "center" }}>Loading…</div>
+      ) : items.length === 0 ? (
+        <div style={{ color: palette.muted, fontSize: 13, padding: "40px 0", textAlign: "center" }}>
+          No feedback in this view.
+        </div>
+      ) : (
+        <div style={{ display: "grid", gap: 10 }}>
+          {items.map((f) => {
+            const sc = statusColors[f.status] || { bg: "#e5e7eb", fg: "#374151" };
+            const draft = drafts[f.id] != null ? drafts[f.id] : (f.admin_reply || "");
+            const dirty = (f.admin_reply || "") !== draft;
+            return (
+              <div key={f.id} style={{
+                border: `1px solid ${palette.border}`, borderRadius: 10, padding: 14,
+                display: "grid", gap: 10,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 999,
+                    background: sc.bg, color: sc.fg, textTransform: "capitalize",
+                  }}>{(f.status || "").replace("_", " ")}</span>
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, color: palette.muted,
+                    textTransform: "uppercase", letterSpacing: 0.5,
+                  }}>{f.category}</span>
+                  {f.is_known_issue && (
+                    <span style={{
+                      fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 999,
+                      background: "#fde68a", color: "#92400e",
+                    }}>📌 Pinned</span>
+                  )}
+                  <span style={{ fontSize: 11, color: palette.muted, marginLeft: "auto" }}>
+                    #{f.id} · {fmtTime(f.created_at)}
+                  </span>
+                </div>
+
+                <div style={{ fontSize: 13, color: palette.dark, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>
+                  {f.message}
+                </div>
+
+                <div style={{ fontSize: 11, color: palette.muted, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                  <span>{f.user_name || f.user_email || "anonymous"}</span>
+                  {f.franchise_name && <span>· {f.franchise_name}</span>}
+                  {f.page_url && <span>· {f.page_url}</span>}
+                  {f.ctx_dock && <span>· dock: {f.ctx_dock}</span>}
+                  {f.ctx_view && <span>· view: {f.ctx_view}</span>}
+                </div>
+
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <select
+                    value={f.status}
+                    onChange={(e) => handleStatus(f.id, e.target.value)}
+                    disabled={busyId === f.id}
+                    style={{
+                      padding: "7px 10px", borderRadius: 8, border: `1px solid ${palette.border}`,
+                      fontSize: 12, fontFamily: "'Open Sans', sans-serif",
+                    }}
+                  >
+                    <option value="new">new</option>
+                    <option value="in_progress">in_progress</option>
+                    <option value="resolved">resolved</option>
+                    <option value="wont_fix">wont_fix</option>
+                  </select>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: palette.muted }}>
+                    <input
+                      type="checkbox"
+                      checked={!!f.is_known_issue}
+                      disabled={busyId === f.id}
+                      onChange={(e) => handlePin(f.id, e.target.checked)}
+                    />
+                    Pin as known issue
+                  </label>
+                </div>
+
+                <div>
+                  <textarea
+                    value={draft}
+                    onChange={(e) => setDrafts((d) => ({ ...d, [f.id]: e.target.value }))}
+                    rows={2}
+                    maxLength={4000}
+                    placeholder="Note to user (visible on their feedback tab)…"
+                    style={{
+                      width: "100%", padding: "8px 10px", borderRadius: 8,
+                      border: `1px solid ${palette.border}`, fontSize: 12,
+                      fontFamily: "'Open Sans', sans-serif", boxSizing: "border-box", resize: "vertical",
+                    }}
+                  />
+                  {f.admin_reply_at && (
+                    <div style={{ fontSize: 10, color: palette.muted, marginTop: 4 }}>
+                      Last saved {fmtTime(f.admin_reply_at)}
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 6, marginTop: 6, justifyContent: "flex-end" }}>
+                    {dirty && (
+                      <button
+                        onClick={() => setDrafts((d) => { const n = { ...d }; delete n[f.id]; return n; })}
+                        disabled={busyId === f.id}
+                        style={{
+                          padding: "6px 12px", borderRadius: 8, border: `1px solid ${palette.border}`,
+                          background: "transparent", color: palette.muted, fontSize: 11, fontWeight: 600,
+                          cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+                        }}
+                      >Cancel</button>
+                    )}
+                    <button
+                      onClick={() => handleReply(f.id)}
+                      disabled={busyId === f.id || !dirty}
+                      style={{
+                        padding: "6px 14px", borderRadius: 8, border: "none",
+                        background: dirty ? palette.dark : "#cbd5e1", color: "#fff",
+                        fontSize: 11, fontWeight: 600,
+                        cursor: dirty && busyId !== f.id ? "pointer" : "not-allowed",
+                        fontFamily: "'Open Sans', sans-serif",
+                      }}
+                    >Save reply</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

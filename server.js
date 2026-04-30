@@ -419,6 +419,203 @@ app.post("/api/admin/users/:id/disable", requireAuth, requireSuperAdmin, async (
   }
 });
 
+// --- Feedback (bug / enhancement / general) ---
+const FEEDBACK_CATEGORIES = new Set(["bug", "feedback", "enhancement"]);
+const FEEDBACK_STATUSES = new Set(["new", "in_progress", "resolved", "wont_fix"]);
+
+const feedbackSubmitLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 6,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many feedback submissions, slow down." },
+});
+
+const feedbackReadLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 60,
+  standardHeaders: true, legacyHeaders: false,
+});
+
+function feedbackToWire(r, { includeReply = true } = {}) {
+  return {
+    id: r.id,
+    ts: r.created_at,
+    category: r.category,
+    message: r.message,
+    status: r.status,
+    page_url: r.page_url,
+    ctx_dock: r.ctx_dock,
+    ctx_view: r.ctx_view,
+    is_known_issue: r.is_known_issue,
+    resolved_at: r.resolved_at,
+    user_email: r.user_email,
+    user_name: r.user_name,
+    franchise_id: r.franchise_id,
+    ...(includeReply && r.admin_reply
+      ? { admin_reply: r.admin_reply, admin_reply_at: r.admin_reply_at }
+      : {}),
+  };
+}
+
+// Submit feedback. Any approved user can post.
+app.post("/api/feedback", requireAuth, feedbackSubmitLimiter, async (req, res) => {
+  const category = String(req.body?.category || "").toLowerCase();
+  const message = String(req.body?.message || "").trim();
+  const ctx = req.body?.context || {};
+  if (!FEEDBACK_CATEGORIES.has(category)) return res.status(400).json({ error: "Invalid category" });
+  if (!message || message.length < 3) return res.status(400).json({ error: "Please include a short description" });
+  if (message.length > 4000) return res.status(400).json({ error: "Message too long (max 4000 chars)" });
+
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO feedback
+         (franchise_id, user_id, user_email, user_name, category, message,
+          page_url, ctx_dock, ctx_view, user_agent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING id`,
+      [
+        req.session.activeFranchiseId || null,
+        req.session.userId,
+        req.session.email || null,
+        req.session.name || null,
+        category,
+        message,
+        ctx.page_url ? String(ctx.page_url).slice(0, 500) : null,
+        ctx.dock ? String(ctx.dock).slice(0, 100) : null,
+        ctx.view ? String(ctx.view).slice(0, 100) : null,
+        (req.get("user-agent") || "").slice(0, 500),
+      ]
+    );
+    res.json({ success: true, id: rows[0].id });
+  } catch (err) {
+    console.error("Feedback submit error:", err);
+    res.status(500).json({ error: "Failed to record feedback" });
+  }
+});
+
+// The submitter's own feedback, with admin replies attached.
+app.get("/api/me/feedback", requireAuth, feedbackReadLimiter, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM feedback WHERE user_id = $1 ORDER BY id DESC LIMIT 100`,
+      [req.session.userId]
+    );
+    res.json({ success: true, feedback: rows.map((r) => feedbackToWire(r)) });
+  } catch (err) {
+    console.error("My-feedback error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Pinned issues, visible to every approved user. Open issues first, then
+// resolved-in-the-last-30-days so techs see what's been fixed recently.
+app.get("/api/known-issues", requireAuth, feedbackReadLimiter, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM feedback
+        WHERE is_known_issue = TRUE
+          AND (status IN ('new','in_progress')
+               OR (status IN ('resolved','wont_fix') AND resolved_at > NOW() - INTERVAL '30 days'))
+        ORDER BY
+          CASE WHEN status IN ('new','in_progress') THEN 0 ELSE 1 END,
+          created_at DESC
+        LIMIT 50`
+    );
+    res.json({ success: true, issues: rows.map((r) => feedbackToWire(r)) });
+  } catch (err) {
+    console.error("Known-issues error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// --- Super-admin: feedback triage ---
+app.get("/api/admin/feedback", requireAuth, requireSuperAdmin, async (req, res) => {
+  const status = req.query.status || null;
+  if (status && !FEEDBACK_STATUSES.has(status)) {
+    return res.status(400).json({ error: "Invalid status filter" });
+  }
+  try {
+    const { rows } = await db.query(
+      `SELECT f.*, fr.name AS franchise_name
+         FROM feedback f
+         LEFT JOIN franchises fr ON fr.id = f.franchise_id
+        WHERE ($1::text IS NULL OR f.status = $1)
+        ORDER BY
+          CASE f.status WHEN 'new' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
+          f.created_at DESC
+        LIMIT 200`,
+      [status]
+    );
+    res.json({ success: true, feedback: rows });
+  } catch (err) {
+    console.error("Admin feedback list error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/admin/feedback/:id/status", requireAuth, requireSuperAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const status = String(req.body?.status || "");
+  if (!id || !FEEDBACK_STATUSES.has(status)) {
+    return res.status(400).json({ error: "Invalid id or status" });
+  }
+  try {
+    const isResolution = status === "resolved" || status === "wont_fix";
+    const { rows } = await db.query(
+      `UPDATE feedback
+          SET status = $1,
+              resolved_at = CASE
+                WHEN $2::boolean THEN COALESCE(resolved_at, NOW())
+                ELSE NULL
+              END
+        WHERE id = $3
+        RETURNING *`,
+      [status, isResolution, id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json({ success: true, feedback: rows[0] });
+  } catch (err) {
+    console.error("Feedback status error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/admin/feedback/:id/reply", requireAuth, requireSuperAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const reply = req.body?.reply == null ? null : String(req.body.reply).trim().slice(0, 4000);
+  if (!id) return res.status(400).json({ error: "Invalid id" });
+  try {
+    const { rows } = await db.query(
+      `UPDATE feedback
+          SET admin_reply = $1,
+              admin_reply_at = CASE WHEN $1 IS NULL THEN NULL ELSE NOW() END
+        WHERE id = $2
+        RETURNING *`,
+      [reply || null, id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json({ success: true, feedback: rows[0] });
+  } catch (err) {
+    console.error("Feedback reply error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/admin/feedback/:id/pin", requireAuth, requireSuperAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const pin = !!req.body?.pin;
+  if (!id) return res.status(400).json({ error: "Invalid id" });
+  try {
+    const { rows } = await db.query(
+      `UPDATE feedback SET is_known_issue = $1 WHERE id = $2 RETURNING *`,
+      [pin, id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+    res.json({ success: true, feedback: rows[0] });
+  } catch (err) {
+    console.error("Feedback pin error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 app.post("/api/admin/users/:id/reinstate", requireAuth, requireSuperAdmin, async (req, res) => {
   const targetId = parseInt(req.params.id, 10);
   try {
