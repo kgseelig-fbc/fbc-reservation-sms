@@ -257,23 +257,36 @@ const api = {
 
 // ─── Excel Parsing ──────────────────────────────────────────────
 const EXPECTED_FIELDS = [
-  { key: "name", label: "Guest Name", required: true, aliases: ["name", "guest", "guest name", "full name", "customer", "member", "member name"] },
-  { key: "email", label: "Email", required: false, aliases: ["email", "e-mail", "email address", "guest email"] },
-  { key: "phone", label: "Phone", required: false, aliases: ["phone", "phone number", "tel", "telephone", "mobile", "cell"] },
-  { key: "service", label: "Service / Type", required: false, aliases: ["service", "type", "reservation type", "event", "event type", "booking type"] },
-  { key: "date", label: "Date", required: true, aliases: ["date", "reservation date", "booking date", "event date", "day"] },
-  { key: "time", label: "Time", required: false, aliases: ["time", "reservation time", "booking time", "start time", "arrival"] },
-  { key: "guests", label: "Guests", required: false, aliases: ["guests", "party size", "party", "covers", "pax", "number of guests", "# guests", "size"] },
-  { key: "notes", label: "Notes", required: false, aliases: ["notes", "note", "comments", "comment", "special requests", "requests", "dietary"] },
-  { key: "channel", label: "Contact Method", required: false, aliases: ["channel", "contact method", "contact", "notification", "preferred contact"] },
+  { key: "locationName", label: "Location Name", required: false, validate: "dock", aliases: ["location name", "location", "dock name", "dock"] },
+  { key: "name", label: "Member Name", required: true, aliases: ["member name", "name", "guest name", "full name", "customer name", "guest", "customer", "member"] },
+  { key: "email", label: "Email", required: false, aliases: ["email address", "member email", "guest email", "email", "e-mail"] },
+  { key: "phone", label: "Phone", required: false, aliases: ["phone number", "phone", "tel", "telephone", "mobile", "cell"] },
+  { key: "service", label: "Resource / Boat", required: false, aliases: ["resource name", "resource", "boat", "service", "type", "reservation type", "event type", "booking type", "event"] },
+  { key: "date", label: "Reservation Date", required: true, aliases: ["reservation date", "booking date", "event date", "date", "day"] },
+  { key: "time", label: "Arrival Time", required: false, aliases: ["arrival time", "start time", "reservation time", "booking time", "arrival", "time"] },
+  { key: "endTime", label: "Return Time", required: false, aliases: ["return time", "end time", "departure time", "return", "departure"] },
+  { key: "guests", label: "Guests", required: false, aliases: ["number of guests", "party size", "# guests", "guests", "party", "covers", "pax", "size"] },
+  { key: "notes", label: "Member Notes", required: false, aliases: ["member notes", "notes", "note", "comments", "comment", "special requests", "requests", "dietary"] },
+  { key: "channel", label: "Contact Method", required: false, aliases: ["contact method", "preferred contact", "channel", "contact", "notification"] },
 ];
 
+// Auto-map prefers exact alias matches first, then partial. A header that's
+// already been claimed by one field can't be claimed by another — this keeps
+// "Arrival Time" from being eaten by the partial "time" alias when a separate
+// "Return Time" column also exists.
 function autoMapColumns(headers) {
   const mapping = {};
+  const used = new Set();
   const lowerHeaders = headers.map((h) => String(h || "").toLowerCase().trim());
+
   EXPECTED_FIELDS.forEach((field) => {
-    const matchIdx = lowerHeaders.findIndex((h) => field.aliases.some((a) => h === a || h.includes(a)));
-    if (matchIdx !== -1) mapping[field.key] = headers[matchIdx];
+    const idx = lowerHeaders.findIndex((h, i) => !used.has(i) && field.aliases.some((a) => h === a));
+    if (idx !== -1) { mapping[field.key] = headers[idx]; used.add(idx); }
+  });
+  EXPECTED_FIELDS.forEach((field) => {
+    if (mapping[field.key]) return;
+    const idx = lowerHeaders.findIndex((h, i) => !used.has(i) && field.aliases.some((a) => h.includes(a)));
+    if (idx !== -1) { mapping[field.key] = headers[idx]; used.add(idx); }
   });
   return mapping;
 }
@@ -317,6 +330,8 @@ function rowsToReservations(rows, mapping) {
     const get = (key) => row[mapping[key]] ?? "";
     const baseDate = parseExcelDate(get("date"));
     const dateWithTime = parseTime(get("time"), baseDate);
+    const endTimeRaw = mapping.endTime ? get("endTime") : "";
+    const endTime = endTimeRaw ? parseTime(endTimeRaw, baseDate) : null;
     const channelRaw = String(get("channel")).toLowerCase().trim();
     const channel = ["sms", "email", "both"].includes(channelRaw) ? channelRaw : "both";
 
@@ -327,6 +342,7 @@ function rowsToReservations(rows, mapping) {
       phone: String(get("phone")).trim(),
       service: String(get("service")).trim() || "Reservation",
       date: dateWithTime || new Date(),
+      endTime: endTime,
       guests: parseInt(get("guests")) || 1,
       status: "unconfirmed",
       channel,
@@ -618,6 +634,10 @@ function Toast({ message, onDismiss }) {
 function ReservationRow({ res, isSelected, isChecked, dispatch }) {
   const dateStr = res.date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
   const timeStr = res.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const endObj = res.endTime ? new Date(res.endTime) : null;
+  const endStr = endObj && !isNaN(endObj.getTime())
+    ? endObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+    : null;
 
   return (
     <div
@@ -692,7 +712,7 @@ function ReservationRow({ res, isSelected, isChecked, dispatch }) {
             fontFamily: "'Open Sans', sans-serif",
             fontWeight: res.timeUpdated ? 600 : 400,
           }}>
-            {timeStr}
+            {endStr ? `${timeStr} – ${endStr}` : timeStr}
             {res.timeUpdated && <span style={{ fontSize: 9, marginLeft: 3 }}>⏱ updated</span>}
           </div>
         </div>
@@ -938,8 +958,13 @@ function SmsComposeModal({ compose, reservations, dispatch, onSend }) {
   const buildDefault = (r) => {
     const dateStr = new Date(r.date).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
     const timeStr = new Date(r.date).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    const endObj = r.endTime ? new Date(r.endTime) : null;
+    const endStr = endObj && !isNaN(endObj.getTime())
+      ? endObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+      : null;
+    const timePhrase = endStr ? `from ${timeStr} to ${endStr}` : `at ${timeStr}`;
     return (
-      `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\n` +
+      `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} ${timePhrase} for ${r.guests} guest(s).\n\n` +
       `Reply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`
     );
   };
@@ -1133,6 +1158,10 @@ function SmsDrawer({ reservation, dispatch }) {
 
   const dateStr = res.date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
   const timeStr = res.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const endObj = res.endTime ? new Date(res.endTime) : null;
+  const endStr = endObj && !isNaN(endObj.getTime())
+    ? endObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+    : null;
 
   return (
     <div style={{
@@ -1192,12 +1221,15 @@ function SmsDrawer({ reservation, dispatch }) {
       }}>
         <div><span style={{ color: palette.muted }}>Date:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{dateStr}</span></div>
         <div>
-          <span style={{ color: palette.muted }}>Time:</span>{" "}
+          <span style={{ color: palette.muted }}>Arrival:</span>{" "}
           <span style={{ fontWeight: 600, color: res.timeUpdated ? palette.accent : palette.dark }}>
             {timeStr}
             {res.timeUpdated && <span style={{ fontSize: 10, marginLeft: 4, color: palette.accent }}>updated</span>}
           </span>
         </div>
+        {endStr && (
+          <div><span style={{ color: palette.muted }}>Return:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{endStr}</span></div>
+        )}
         <div><span style={{ color: palette.muted }}>Guests:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.guests}</span></div>
         <div><span style={{ color: palette.muted }}>Service:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.service}</span></div>
       </div>
@@ -1340,7 +1372,7 @@ function SmsOverlay({ onClose }) {
 }
 
 // ─── Upload Panel ────────────────────────────────────────────────
-function UploadPanel({ dispatch }) {
+function UploadPanel({ dispatch, dockName }) {
   const [step, setStep] = useState("upload"); // upload | mapping | preview
   const [dragOver, setDragOver] = useState(false);
   const [fileName, setFileName] = useState("");
@@ -1403,7 +1435,7 @@ function UploadPanel({ dispatch }) {
 
   const handleImport = () => {
     if (!mapping.name || !mapping.date) {
-      setError("Guest Name and Date are required fields. Please map them before importing.");
+      setError("Member Name and Reservation Date are required fields. Please map them before importing.");
       return;
     }
     const reservations = rowsToReservations(rows, mapping);
@@ -1417,6 +1449,26 @@ function UploadPanel({ dispatch }) {
   const mappedCount = EXPECTED_FIELDS.filter((f) => mapping[f.key]).length;
   const requiredMapped = EXPECTED_FIELDS.filter((f) => f.required && mapping[f.key]).length;
   const requiredTotal = EXPECTED_FIELDS.filter((f) => f.required).length;
+
+  // Warn (don't block) when the Location Name column doesn't line up with the
+  // dock the user picked — catches "wrong dock" uploads without preventing a
+  // mis-spelled or differently-cased location from being imported.
+  const locationWarning = (() => {
+    if (!mapping.locationName || !dockName) return null;
+    const target = String(dockName).toLowerCase().trim();
+    let mismatched = 0;
+    const samples = new Set();
+    rows.forEach((row) => {
+      const val = String(row[mapping.locationName] ?? "").toLowerCase().trim();
+      if (!val) return;
+      if (val !== target && !val.includes(target) && !target.includes(val)) {
+        mismatched++;
+        if (samples.size < 3) samples.add(row[mapping.locationName]);
+      }
+    });
+    if (mismatched === 0) return null;
+    return `${mismatched} of ${rows.length} rows have a Location Name that doesn't match "${dockName}" (e.g. ${[...samples].map((s) => `"${s}"`).join(", ")}). Imports will still go into the selected dock — switch docks if this is the wrong one.`;
+  })();
 
   // ── Upload Step ──
   if (step === "upload") {
@@ -1565,6 +1617,15 @@ function UploadPanel({ dispatch }) {
             background: palette.redLight, color: palette.red,
             fontSize: 13, fontFamily: "'Open Sans', sans-serif",
           }}>⚠ {error}</div>
+        )}
+
+        {locationWarning && (
+          <div style={{
+            marginBottom: 16, padding: "12px 18px", borderRadius: 12,
+            background: palette.amberLight, color: palette.amber,
+            fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+            border: `1px solid ${palette.amber}40`,
+          }}>⚠ {locationWarning}</div>
         )}
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -2210,6 +2271,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           const parsed = data.reservations.map((r) => ({
             ...r,
             date: new Date(r.date),
+            endTime: r.endTime ? new Date(r.endTime) : null,
             messageTime: r.messageTime ? new Date(r.messageTime) : null,
             smsLog: (r.smsLog || []).map((m) => ({ ...m, time: new Date(m.time) })),
           }));
@@ -2247,7 +2309,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
     if (!state.currentDock) return;
     try {
       const data = await api.fetchReservations(state.currentDock);
-      if (data.reservations) dispatch({ type: "LOAD_DATA_SILENT", payload: data.reservations.map((r) => ({ ...r, date: new Date(r.date), messageTime: r.messageTime ? new Date(r.messageTime) : null, smsLog: (r.smsLog || []).map((m) => ({ ...m, time: new Date(m.time) })) })) });
+      if (data.reservations) dispatch({ type: "LOAD_DATA_SILENT", payload: data.reservations.map((r) => ({ ...r, date: new Date(r.date), endTime: r.endTime ? new Date(r.endTime) : null, messageTime: r.messageTime ? new Date(r.messageTime) : null, smsLog: (r.smsLog || []).map((m) => ({ ...m, time: new Date(m.time) })) })) });
     } catch { /* silently fail */ }
   };
 
@@ -2602,10 +2664,13 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
         ) : state.view === "feedback" && me && me.user && me.user.role === "super_admin" ? (
           <AdminFeedbackPanel palette={palette} />
         ) : state.view === "upload" || (state.view === "reservations" && state.reservations.length === 0) ? (
-          <UploadPanel dispatch={(action) => {
-            liveDispatch(action);
-            if (action.type === "LOAD_DATA") dispatch({ type: "SET_VIEW", payload: "reservations" });
-          }} />
+          <UploadPanel
+            dockName={DOCKS.find((d) => d.id === state.currentDock)?.name || ""}
+            dispatch={(action) => {
+              liveDispatch(action);
+              if (action.type === "LOAD_DATA") dispatch({ type: "SET_VIEW", payload: "reservations" });
+            }}
+          />
         ) : state.view === "reservations" ? (
           <>
             {/* Stats */}

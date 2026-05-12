@@ -692,6 +692,7 @@ function rowToReservation(r) {
     phone: r.phone || "",
     service: r.service || "Reservation",
     date: r.reservation_date,
+    endTime: r.return_time || null,
     guests: r.guests || 1,
     status: r.status || "unconfirmed",
     channel: r.channel || "sms",
@@ -821,12 +822,12 @@ app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async
         await c.query(
           `INSERT INTO reservations
            (id, franchise_id, import_batch_id, source_id, dock_id, phone, name, email, service,
-            reservation_date, guests, status, channel, notes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+            reservation_date, return_time, guests, status, channel, notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
           [
             reservationId, req.franchiseId, batchId, sourceId, dockId, normalizedPhone,
             r.name || `Guest ${i + 1}`, r.email || "", r.service || "Reservation",
-            r.date || null, r.guests || 1, r.status || "unconfirmed", r.channel || "sms", r.notes || "",
+            r.date || null, r.endTime || null, r.guests || 1, r.status || "unconfirmed", r.channel || "sms", r.notes || "",
           ]
         );
       }
@@ -862,11 +863,17 @@ function buildSmsBody(reservation) {
   const dateObj = new Date(reservation.reservation_date || reservation.date);
   const dateStr = dateObj.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
   const timeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const returnRaw = reservation.return_time || reservation.endTime;
+  const returnObj = returnRaw ? new Date(returnRaw) : null;
+  const returnStr = returnObj && !isNaN(returnObj.getTime())
+    ? returnObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+    : null;
+  const timePhrase = returnStr ? `from ${timeStr} to ${returnStr}` : `at ${timeStr}`;
   const name = reservation.name || "there";
   return (
     `Hi ${name.split(" ")[0]}! ` +
     `This is a reminder about your upcoming ${reservation.service || "reservation"} ` +
-    `on ${dateStr} at ${timeStr} for ${reservation.guests || 1} guest(s).\n\n` +
+    `on ${dateStr} ${timePhrase} for ${reservation.guests || 1} guest(s).\n\n` +
     `Can you make it? Just reply YES to confirm, CANCEL to cancel, or send a new time (e.g. 7:30 AM) if you need to change your arrival.`
   );
 }
