@@ -693,6 +693,11 @@ function rowToReservation(r) {
     service: r.service || "Reservation",
     date: r.reservation_date,
     endTime: r.return_time || null,
+    memberMobile: r.member_mobile || "",
+    contactMobile: r.contact_mobile || "",
+    contactHomePhone: r.contact_home_phone || "",
+    contactPhone: r.contact_phone || "",
+    locationInfo: r.location_info || "",
     guests: r.guests || 1,
     status: r.status || "unconfirmed",
     channel: r.channel || "sms",
@@ -822,12 +827,14 @@ app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async
         await c.query(
           `INSERT INTO reservations
            (id, franchise_id, import_batch_id, source_id, dock_id, phone, name, email, service,
-            reservation_date, return_time, guests, status, channel, notes)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+            reservation_date, return_time, guests, status, channel, notes,
+            member_mobile, contact_mobile, contact_home_phone, contact_phone, location_info)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
           [
             reservationId, req.franchiseId, batchId, sourceId, dockId, normalizedPhone,
             r.name || `Guest ${i + 1}`, r.email || "", r.service || "Reservation",
             r.date || null, r.endTime || null, r.guests || 1, r.status || "unconfirmed", r.channel || "sms", r.notes || "",
+            r.memberMobile || "", r.contactMobile || "", r.contactHomePhone || "", r.contactPhone || "", r.locationInfo || "",
           ]
         );
       }

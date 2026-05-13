@@ -258,9 +258,14 @@ const api = {
 // ─── Excel Parsing ──────────────────────────────────────────────
 const EXPECTED_FIELDS = [
   { key: "locationName", label: "Location Name", required: false, validate: "dock", aliases: ["location name", "location", "dock name", "dock"] },
+  { key: "locationInfo", label: "Location Info", required: false, aliases: ["location info text", "location info", "location details", "location notes"] },
   { key: "name", label: "Member Name", required: true, aliases: ["member name", "name", "guest name", "full name", "customer name", "guest", "customer", "member"] },
   { key: "email", label: "Email", required: false, aliases: ["email address", "member email", "guest email", "email", "e-mail"] },
   { key: "phone", label: "Phone", required: false, aliases: ["phone number", "phone", "tel", "telephone", "mobile", "cell"] },
+  { key: "memberMobile", label: "Member Mobile", required: false, aliases: ["member mobile number", "member mobile", "member cell"] },
+  { key: "contactMobile", label: "Contact: Mobile", required: false, aliases: ["contact: mobile", "contact mobile"] },
+  { key: "contactPhone", label: "Contact: Phone", required: false, aliases: ["contact: phone", "contact phone"] },
+  { key: "contactHomePhone", label: "Contact: Home Phone", required: false, aliases: ["contact: home phone", "contact home phone", "home phone"] },
   { key: "service", label: "Resource / Boat", required: false, aliases: ["resource name", "resource", "boat", "service", "type", "reservation type", "event type", "booking type", "event"] },
   { key: "date", label: "Reservation Date", required: true, aliases: ["reservation date", "booking date", "event date", "date", "day"] },
   { key: "time", label: "Arrival Time", required: false, aliases: ["arrival time", "start time", "reservation time", "booking time", "arrival", "time"] },
@@ -335,11 +340,28 @@ function rowsToReservations(rows, mapping) {
     const channelRaw = String(get("channel")).toLowerCase().trim();
     const channel = ["sms", "email", "both"].includes(channelRaw) ? channelRaw : "both";
 
+    const memberMobile = String(get("memberMobile")).trim();
+    const contactMobile = String(get("contactMobile")).trim();
+    const contactHomePhone = String(get("contactHomePhone")).trim();
+    const contactPhone = String(get("contactPhone")).trim();
+    const phoneCol = String(get("phone")).trim();
+    // SMS target chosen per row: mobile-first, then any generic Phone column
+    // the user mapped, then the landline-style fallbacks. The other numbers
+    // are still stored separately and shown in the detail panel.
+    const primaryPhone =
+      memberMobile || contactMobile || phoneCol || contactPhone || contactHomePhone;
+    const locationInfo = String(get("locationInfo")).trim();
+
     return {
       id: `RES-${String(i + 1).padStart(3, "0")}`,
       name: String(get("name")).trim() || `Guest ${i + 1}`,
       email: String(get("email")).trim(),
-      phone: String(get("phone")).trim(),
+      phone: primaryPhone,
+      memberMobile,
+      contactMobile,
+      contactHomePhone,
+      contactPhone,
+      locationInfo,
       service: String(get("service")).trim() || "Reservation",
       date: dateWithTime || new Date(),
       endTime: endTime,
@@ -1232,6 +1254,20 @@ function SmsDrawer({ reservation, dispatch }) {
         )}
         <div><span style={{ color: palette.muted }}>Guests:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.guests}</span></div>
         <div><span style={{ color: palette.muted }}>Service:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.service}</span></div>
+        {res.locationInfo && (
+          <div style={{ flexBasis: "100%" }}>
+            <span style={{ color: palette.muted }}>Location info:</span>{" "}
+            <span style={{ fontWeight: 600, color: palette.dark }}>{res.locationInfo}</span>
+          </div>
+        )}
+        {(res.memberMobile || res.contactMobile || res.contactPhone || res.contactHomePhone) && (
+          <div style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", gap: 12, paddingTop: 4, borderTop: `1px dashed ${palette.border}` }}>
+            {res.memberMobile && <div><span style={{ color: palette.muted }}>Mobile:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.memberMobile}</span></div>}
+            {res.contactMobile && res.contactMobile !== res.memberMobile && <div><span style={{ color: palette.muted }}>Contact mobile:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.contactMobile}</span></div>}
+            {res.contactPhone && <div><span style={{ color: palette.muted }}>Contact phone:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.contactPhone}</span></div>}
+            {res.contactHomePhone && <div><span style={{ color: palette.muted }}>Home:</span> <span style={{ fontWeight: 600, color: palette.dark }}>{res.contactHomePhone}</span></div>}
+          </div>
+        )}
       </div>
 
       {/* Message Thread */}
