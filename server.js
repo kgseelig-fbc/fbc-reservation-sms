@@ -1043,7 +1043,7 @@ async function parseAndApplyReply(inboundText, reservation) {
   const replyLower = inboundText.toLowerCase().replace(/[^a-z0-9\s:]/g, "").trim();
 
   const confirmPatterns = /^(confirm|confirmed|yes|yep|yeah|yea|yup|y|c|ok|okay|sure|sounds good|good|great|absolutely|perfect|see you there|will be there|we will be there|ill be there|looking forward|affirmative)$/;
-  const confirmLoose = /(confirm|yes|yep|yeah|yup|sounds good|okay|ok sure|absolutely|perfect|see you|will be there|looking forward|count me in|im in|we're in|all good|good to go)/;
+  const confirmLoose = /(confirm|yes|yep|yeah|yup|sounds good|okay|ok sure|absolutely|perfect|see you (there|soon|then|at)|will be there|looking forward|count me in|im in|we're in|all good|good to go)/;
   const cancelPatterns = /^(cancel|cancelled|no|nope|nah|n|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|remove|pass)$/;
   const cancelLoose = /(cancel|cant make it|can not make it|cannot make it|wont be there|not coming|count me out|need to cancel|want to cancel|have to cancel|please cancel)/;
   const timeMatch = replyLower.match(
@@ -1054,13 +1054,26 @@ async function parseAndApplyReply(inboundText, reservation) {
     return "Sorry, we couldn't find a reservation associated with this number. Please call us directly for assistance.";
   }
 
-  if (confirmPatterns.test(replyLower) || confirmLoose.test(replyLower)) {
+  // Cancel is checked before confirm at every tier: a sentence that contains
+  // both signals (e.g. "need to cancel, see you next time") should cancel —
+  // mis-confirming a cancel is the costlier failure mode of the two.
+  // Strict (whole-message exact match) wins over loose for unambiguous replies
+  // like "YES" / "NO".
+  if (cancelPatterns.test(replyLower)) {
+    await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
+    return "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
+  }
+  if (confirmPatterns.test(replyLower)) {
     await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
     return "Thank you! Your reservation is confirmed. We look forward to seeing you!";
   }
-  if (cancelPatterns.test(replyLower) || cancelLoose.test(replyLower)) {
+  if (cancelLoose.test(replyLower)) {
     await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
     return "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
+  }
+  if (confirmLoose.test(replyLower)) {
+    await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
+    return "Thank you! Your reservation is confirmed. We look forward to seeing you!";
   }
   if (timeMatch) {
     let h = parseInt(timeMatch[1]);
