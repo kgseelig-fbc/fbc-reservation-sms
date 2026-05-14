@@ -1474,6 +1474,11 @@ function UploadPanel({ dispatch, dockName }) {
       setError("Member Name and Reservation Date are required fields. Please map them before importing.");
       return;
     }
+    const phoneKeys = ["phone", "memberMobile", "contactMobile", "contactPhone", "contactHomePhone"];
+    if (!phoneKeys.some((k) => mapping[k])) {
+      setError("No phone column mapped. SMS won't work without a phone number — map at least one of Phone, Member Mobile, Contact: Mobile, Contact: Phone, or Contact: Home Phone before importing.");
+      return;
+    }
     const reservations = rowsToReservations(rows, mapping);
     if (reservations.length === 0) {
       setError("No valid reservations found. Check that your date and name columns contain data.");
@@ -2407,7 +2412,14 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
         try {
           const result = await api.sendBulk(action.ids, state.currentDock);
           if (result.success) {
-            dispatch({ type: "SHOW_TOAST", payload: `${result.sent} SMS sent via Twilio!` });
+            const { sent, failed, requested, skippedNoPhone, skippedAlreadySent } = result;
+            const parts = [];
+            if (sent > 0) parts.push(`${sent} sent`);
+            if (failed > 0) parts.push(`${failed} failed`);
+            if (skippedNoPhone > 0) parts.push(`${skippedNoPhone} skipped (no phone)`);
+            if (skippedAlreadySent > 0) parts.push(`${skippedAlreadySent} skipped (already messaged)`);
+            const summary = parts.length ? parts.join(", ") : "0 sent";
+            dispatch({ type: "SHOW_TOAST", payload: `${summary} of ${requested}` });
             dispatch({ type: "DESELECT_ALL" });
             await refreshFromServer();
           }

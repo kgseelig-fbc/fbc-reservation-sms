@@ -948,24 +948,26 @@ app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req,
   const { ids, dock: dockId } = req.body;
   if (!dockId) return res.status(400).json({ error: "Missing dock parameter" });
 
-  let targets;
+  // Fetch the full candidate set without the eligibility filter so we can
+  // report back exactly how many were skipped and why (no phone vs. already
+  // sent). The toast in the UI uses these counts to explain a 0-sent result.
+  let candidates;
   try {
     if (ids === "all") {
       const { rows } = await db.query(
         `SELECT * FROM reservations
          WHERE franchise_id = $1 AND dock_id = $2
-           AND import_batch_id = (SELECT MAX(id) FROM import_batches WHERE franchise_id = $1 AND dock_id = $2)
-           AND message_sent = FALSE AND phone <> ''`,
+           AND import_batch_id = (SELECT MAX(id) FROM import_batches WHERE franchise_id = $1 AND dock_id = $2)`,
         [req.franchiseId, dockId]
       );
-      targets = rows;
+      candidates = rows;
     } else if (Array.isArray(ids)) {
       const { rows } = await db.query(
         `SELECT * FROM reservations
-         WHERE id = ANY($1::text[]) AND franchise_id = $2 AND message_sent = FALSE AND phone <> ''`,
+         WHERE id = ANY($1::text[]) AND franchise_id = $2`,
         [ids, req.franchiseId]
       );
-      targets = rows;
+      candidates = rows;
     } else {
       return res.status(400).json({ error: "Provide ids array or 'all'" });
     }
@@ -973,6 +975,11 @@ app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req,
     console.error("Bulk target query error:", err);
     return res.status(500).json({ error: "Database error" });
   }
+
+  const requested = candidates.length;
+  const skippedNoPhone = candidates.filter((r) => !r.phone).length;
+  const skippedAlreadySent = candidates.filter((r) => r.phone && r.message_sent).length;
+  const targets = candidates.filter((r) => r.phone && !r.message_sent);
 
   const results = { sent: 0, failed: 0, errors: [] };
   for (const r of targets) {
@@ -985,7 +992,7 @@ app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req,
       results.errors.push({ id: r.id, error: err.message });
     }
   }
-  res.json({ success: true, ...results });
+  res.json({ success: true, requested, skippedNoPhone, skippedAlreadySent, ...results });
 });
 
 // --- Admin chat box — send arbitrary SMS to a reservation's phone ---
