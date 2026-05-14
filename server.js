@@ -14,6 +14,7 @@ const crypto = require("crypto");
 const path = require("path");
 const { OAuth2Client } = require("google-auth-library");
 const db = require("./db");
+const { classifyIntent } = require("./lib/intent");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -1039,6 +1040,54 @@ app.post("/api/sms/simulate", requireAuth, requireFranchiseContext, async (req, 
 });
 
 // --- Inbound reply parsing (Postgres-native) ---
+//
+// Resolution order:
+//   1. Strict patterns (exact one-word replies like YES / NO / CANCEL).
+//      Free, deterministic, and instant — no API call.
+//   2. Claude (Haiku 4.5) intent classification — handles paraphrasing,
+//      mixed signals, and natural language the regex can't reason about.
+//   3. Loose regex fallback tiers — only reached if Claude is unavailable
+//      (no API key, network error, timeout) or returned "unknown".
+//
+// Cancel is checked before confirm at every tier — mis-confirming a cancel is
+// the costlier failure mode of the two.
+const CONFIRM_RESPONSE = "Thank you! Your reservation is confirmed. We look forward to seeing you!";
+const CANCEL_RESPONSE = "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
+const HANDOFF_RESPONSE =
+  "Thanks for reaching out! A team member will follow up with you shortly.\n\n" +
+  "If you also want to confirm or change this reservation, reply YES, CANCEL, " +
+  "or a new time like \"7:30 AM\".";
+const ROBOTIC_FALLBACK =
+  "Sorry, I didn't quite catch that. You can reply:\n" +
+  "• YES to confirm\n" +
+  "• CANCEL to cancel\n" +
+  "• A new time like \"7:30 AM\" to change your arrival";
+
+async function applyCancel(reservation) {
+  await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
+  return CANCEL_RESPONSE;
+}
+
+async function applyConfirm(reservation) {
+  await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
+  return CONFIRM_RESPONSE;
+}
+
+async function applyTimeChange(reservation, hour, minute) {
+  const dateObj = new Date(reservation.reservation_date);
+  const originalTime = reservation.original_time || reservation.reservation_date;
+  dateObj.setHours(hour, minute, 0, 0);
+  await db.query(
+    `UPDATE reservations
+     SET reservation_date = $1, time_updated = TRUE,
+         original_time = COALESCE(original_time, $2)
+     WHERE id = $3`,
+    [dateObj.toISOString(), originalTime, reservation.id]
+  );
+  const newTimeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  return `Got it! Your arrival time has been updated to ${newTimeStr}. Just reply YES to confirm your reservation.`;
+}
+
 async function parseAndApplyReply(inboundText, reservation) {
   const replyLower = inboundText.toLowerCase().replace(/[^a-z0-9\s:]/g, "").trim();
 
@@ -1049,59 +1098,57 @@ async function parseAndApplyReply(inboundText, reservation) {
   const timeMatch = replyLower.match(
     /(?:time|change.*time|move.*to|reschedule.*to|change.*to|switch.*to|make it|new time)?\s*(\d{1,2}):?(\d{2})?\s*(am|pm)/i
   );
+  const handoffOrInquiry = /(human|real person|talk to|speak to|chat with|customer service|live person|representative|\bagent\b|\bmanager\b|do you have|any boats|boats? avail|any avail|any open|any slot|any free|reservation for|reserve a|book (a|another)|want to book|new booking)/;
 
   if (!reservation) {
     return "Sorry, we couldn't find a reservation associated with this number. Please call us directly for assistance.";
   }
 
-  // Cancel is checked before confirm at every tier: a sentence that contains
-  // both signals (e.g. "need to cancel, see you next time") should cancel —
-  // mis-confirming a cancel is the costlier failure mode of the two.
-  // Strict (whole-message exact match) wins over loose for unambiguous replies
-  // like "YES" / "NO".
-  if (cancelPatterns.test(replyLower)) {
-    await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
-    return "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
+  // Tier 1 — strict patterns. Catches the common short replies instantly
+  // without an API round-trip.
+  if (cancelPatterns.test(replyLower)) return applyCancel(reservation);
+  if (confirmPatterns.test(replyLower)) return applyConfirm(reservation);
+
+  // Tier 2 — Claude intent classification. Returns null on missing API key,
+  // network error, or timeout; in that case we fall through to the regex
+  // tiers below so the bot still works during an outage.
+  const llm = await classifyIntent(inboundText);
+  if (llm) {
+    console.log(`Claude intent: ${llm.intent}${llm.intent === "time_change" ? ` ${llm.hour}:${String(llm.minute).padStart(2, "0")}` : ""} ("${inboundText.slice(0, 80)}")`);
+    switch (llm.intent) {
+      case "cancel":
+        return applyCancel(reservation);
+      case "confirm":
+        return applyConfirm(reservation);
+      case "time_change":
+        if (Number.isInteger(llm.hour) && Number.isInteger(llm.minute)) {
+          return applyTimeChange(reservation, llm.hour, llm.minute);
+        }
+        break;
+      case "handoff":
+        return HANDOFF_RESPONSE;
+      case "unknown":
+        // Fall through to regex tiers; if those also miss, robotic fallback.
+        break;
+    }
   }
-  if (confirmPatterns.test(replyLower)) {
-    await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
-    return "Thank you! Your reservation is confirmed. We look forward to seeing you!";
-  }
-  if (cancelLoose.test(replyLower)) {
-    await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
-    return "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
-  }
-  if (confirmLoose.test(replyLower)) {
-    await db.query(`UPDATE reservations SET status = 'confirmed' WHERE id = $1`, [reservation.id]);
-    return "Thank you! Your reservation is confirmed. We look forward to seeing you!";
-  }
+
+  // Tier 3 — loose regex. Only reached if Claude returned null or "unknown".
+  if (cancelLoose.test(replyLower)) return applyCancel(reservation);
+  if (confirmLoose.test(replyLower)) return applyConfirm(reservation);
   if (timeMatch) {
     let h = parseInt(timeMatch[1]);
     const m = parseInt(timeMatch[2] || "0");
     const ampm = timeMatch[3];
     if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
     if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
-
-    const dateObj = new Date(reservation.reservation_date);
-    const originalTime = reservation.original_time || reservation.reservation_date;
-    dateObj.setHours(h, m, 0, 0);
-    await db.query(
-      `UPDATE reservations
-       SET reservation_date = $1, time_updated = TRUE,
-           original_time = COALESCE(original_time, $2)
-       WHERE id = $3`,
-      [dateObj.toISOString(), originalTime, reservation.id]
-    );
-    const newTimeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-    return `Got it! Your arrival time has been updated to ${newTimeStr}. Just reply YES to confirm your reservation.`;
+    return applyTimeChange(reservation, h, m);
+  }
+  if (handoffOrInquiry.test(replyLower) || inboundText.includes("?")) {
+    return HANDOFF_RESPONSE;
   }
 
-  return (
-    "Sorry, I didn't quite catch that. You can reply:\n" +
-    "• YES to confirm\n" +
-    "• CANCEL to cancel\n" +
-    "• A new time like \"7:30 AM\" to change your arrival"
-  );
+  return ROBOTIC_FALLBACK;
 }
 
 // --- Twilio inbound webhook ---
