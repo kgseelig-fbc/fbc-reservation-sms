@@ -288,6 +288,16 @@ const api = {
     return res.json();
   },
 
+  async sendToPhones(phones, body) {
+    const res = await fetch(`${API_BASE}/api/sms/send-to-phones`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ phones, body }),
+    });
+    return res.json();
+  },
+
   async listImportBatches(dockId) {
     const qs = dockId ? `?dock=${encodeURIComponent(dockId)}` : "";
     const res = await fetch(`${API_BASE}/api/import-batches${qs}`, {
@@ -2373,25 +2383,38 @@ function BulkActionBar({ count, dispatch, reservations, selected }) {
   );
 }
 
-// ─── Conversations Panel ─────────────────────────────────────────
-// ─── New Message composer ─────────────────────────────────────
-// Compose modal launched from the Conversations page. Recipient field
-// autocompletes against /api/members (search-as-you-type), but also accepts
-// a raw phone for someone who isn't a member yet. Free-typed numbers go
-// through a confirm step before send.
+// ─── New Message composer (multi-recipient) ────────────────────
+// Lets staff send one message to many people. Recipients are chips —
+// added by picking from the autocomplete (against /api/members) or by
+// typing a phone and hitting Enter / comma / Tab. Free-typed numbers
+// (i.e. not in the members directory) are flagged so the confirm step
+// can warn before send.
+function normalizeUsPhone(raw) {
+  if (!raw) return "";
+  let digits = String(raw).replace(/\D/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (String(raw).startsWith("+")) return String(raw).replace(/[^\d+]/g, "");
+  return digits ? `+${digits}` : "";
+}
+function looksLikePhoneFn(s) {
+  return String(s || "").replace(/\D/g, "").length >= 10;
+}
+
 function NewMessageModal({ onClose, onSent }) {
+  // recipients: [{ phone, name, isMember }]
+  const [recipients, setRecipients] = useState([]);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
   const [showDropdown, setShowDropdown] = useState(false);
-  const [picked, setPicked] = useState(null); // {phone, name} when chosen from autocomplete
   const [body, setBody] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [pendingConfirm, setPendingConfirm] = useState(false);
+  const inputRef = useRef(null);
 
-  // Search-as-you-type with a short debounce. We always query because even
-  // an empty string returns recent members (handy when the user just wants
-  // a list).
+  // Search-as-you-type. Empty query returns recent members so the dropdown
+  // doubles as a "pick from recent" picker.
   useEffect(() => {
     let cancelled = false;
     const t = setTimeout(async () => {
@@ -2405,35 +2428,81 @@ function NewMessageModal({ onClose, onSent }) {
     return () => { cancelled = true; clearTimeout(t); };
   }, [query]);
 
-  const normalizedPhone = (() => {
-    // Mirror the server's normalizePhone for the confirm dialog preview.
-    let digits = query.replace(/\D/g, "");
-    if (digits.length === 10) return `+1${digits}`;
-    if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
-    return query.startsWith("+") ? query : (digits ? `+${digits}` : "");
-  })();
-  const looksLikePhone = query.replace(/\D/g, "").length >= 10;
-  const canSend = (picked || looksLikePhone) && body.trim().length > 0 && !sending;
+  const hasPhone = (phone) => recipients.some((r) => r.phone === phone);
+
+  const addRecipient = (r) => {
+    if (!r || !r.phone || hasPhone(r.phone)) return;
+    setRecipients((prev) => [...prev, r]);
+    setQuery("");
+    setShowDropdown(false);
+    setError("");
+    // Keep focus in the input so the user can keep adding
+    setTimeout(() => inputRef.current && inputRef.current.focus(), 0);
+  };
+
+  const addFromQuery = () => {
+    const trimmed = query.trim();
+    if (!trimmed) return false;
+    if (!looksLikePhoneFn(trimmed)) {
+      setError("That doesn't look like a 10-digit phone number.");
+      return false;
+    }
+    addRecipient({ phone: normalizeUsPhone(trimmed), name: null, isMember: false });
+    return true;
+  };
+
+  const removeRecipient = (phone) => {
+    setRecipients((prev) => prev.filter((r) => r.phone !== phone));
+  };
+
+  const onInputKeyDown = (e) => {
+    if ((e.key === "Enter" || e.key === ",") && query.trim()) {
+      e.preventDefault();
+      addFromQuery();
+    } else if (e.key === "Tab" && query.trim() && looksLikePhoneFn(query)) {
+      e.preventDefault();
+      addFromQuery();
+    } else if (e.key === "Backspace" && !query && recipients.length > 0) {
+      // Backspace on empty input removes the last chip — standard pattern.
+      setRecipients((prev) => prev.slice(0, -1));
+    }
+  };
+
+  const newCount = recipients.filter((r) => !r.isMember).length;
+  const canSend = recipients.length > 0 && body.trim().length > 0 && !sending;
 
   const initiateSend = () => {
     setError("");
     if (!canSend) return;
-    if (picked) {
-      // Known member: send directly.
-      doSend(picked.phone);
-    } else {
-      // Free-typed number: require explicit confirm.
+    // If the user typed but didn't add the pending query, fold it in first.
+    if (query.trim() && looksLikePhoneFn(query) && !hasPhone(normalizeUsPhone(query))) {
+      const added = addFromQuery();
+      if (!added) return;
+    }
+    // Any unknown numbers? Require explicit confirm.
+    const hasUnknown = recipients.some((r) => !r.isMember) ||
+      (query.trim() && looksLikePhoneFn(query));
+    if (hasUnknown) {
       setPendingConfirm(true);
+    } else {
+      doSend();
     }
   };
 
-  const doSend = async (phone) => {
+  const doSend = async () => {
     setSending(true);
     setPendingConfirm(false);
     try {
-      const r = await api.sendToPhone(phone, body.trim());
+      const phones = recipients.map((r) => r.phone);
+      const r = await api.sendToPhones(phones, body.trim());
       if (r.success) {
-        onSent && onSent(r.phone || phone);
+        onSent && onSent({
+          sent: r.sent || 0,
+          failed: r.failed || 0,
+          requested: r.requested || phones.length,
+          phones,
+          singleRecipientPhone: phones.length === 1 ? phones[0] : null,
+        });
       } else {
         setError(r.error || "Failed to send");
       }
@@ -2443,6 +2512,10 @@ function NewMessageModal({ onClose, onSent }) {
       setSending(false);
     }
   };
+
+  // Filter the autocomplete to hide already-picked recipients so the dropdown
+  // can't be used to add the same person twice.
+  const visibleResults = results.filter((m) => !hasPhone(m.phone));
 
   return (
     <>
@@ -2457,7 +2530,7 @@ function NewMessageModal({ onClose, onSent }) {
         style={{
           position: "fixed", top: "50%", left: "50%",
           transform: "translate(-50%, -50%)",
-          width: "min(520px, 92vw)", background: palette.card,
+          width: "min(560px, 92vw)", background: palette.card,
           borderRadius: 16, zIndex: 1001,
           boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
           display: "flex", flexDirection: "column", maxHeight: "90vh",
@@ -2467,10 +2540,18 @@ function NewMessageModal({ onClose, onSent }) {
           padding: "18px 22px", borderBottom: `1px solid ${palette.border}`,
           display: "flex", alignItems: "center", justifyContent: "space-between",
         }}>
-          <div style={{
-            fontSize: 17, fontWeight: 700, color: palette.dark,
-            fontFamily: "'Montserrat', sans-serif",
-          }}>New Message</div>
+          <div>
+            <div style={{
+              fontSize: 17, fontWeight: 700, color: palette.dark,
+              fontFamily: "'Montserrat', sans-serif",
+            }}>New Message</div>
+            <div style={{
+              fontSize: 11, color: palette.muted, marginTop: 2,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>
+              Send the same message to one or many recipients.
+            </div>
+          </div>
           <button
             onClick={onClose}
             style={{
@@ -2488,54 +2569,107 @@ function NewMessageModal({ onClose, onSent }) {
               color: palette.muted, letterSpacing: 0.5,
               textTransform: "uppercase", marginBottom: 6,
               fontFamily: "'Open Sans', sans-serif",
-            }}>To</label>
-            <input
-              type="text"
-              value={picked ? `${picked.name || picked.phone} · ${picked.phone}` : query}
-              onChange={(e) => {
-                setPicked(null);
-                setQuery(e.target.value);
-                setShowDropdown(true);
-              }}
-              onFocus={() => setShowDropdown(true)}
-              onBlur={() => setTimeout(() => setShowDropdown(false), 150)}
-              placeholder="Name or phone (e.g. 904-555-0102)"
+            }}>
+              To {recipients.length > 0 && (
+                <span style={{
+                  marginLeft: 6, padding: "1px 7px", borderRadius: 8,
+                  background: palette.accent, color: "#fff",
+                  fontSize: 10, letterSpacing: 0,
+                }}>{recipients.length}</span>
+              )}
+            </label>
+
+            <div
+              onClick={() => inputRef.current && inputRef.current.focus()}
               style={{
-                width: "100%", padding: "10px 12px", borderRadius: 10,
-                border: `1.5px solid ${picked ? palette.green : palette.border}`,
-                background: picked ? palette.greenLight + "40" : "#fff",
-                fontSize: 14, fontFamily: "'Open Sans', sans-serif",
-                color: palette.dark, outline: "none", boxSizing: "border-box",
+                display: "flex", flexWrap: "wrap", gap: 6,
+                padding: "8px 10px", borderRadius: 10,
+                border: `1.5px solid ${palette.border}`, background: "#fff",
+                minHeight: 44, cursor: "text",
               }}
-            />
-            {picked && (
-              <button
-                onClick={() => { setPicked(null); setQuery(""); }}
+            >
+              {recipients.map((r) => (
+                <span
+                  key={r.phone}
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 6,
+                    padding: "4px 4px 4px 10px", borderRadius: 999,
+                    background: r.isMember ? palette.accentLight : palette.amberLight,
+                    color: r.isMember ? palette.accent : palette.amber,
+                    border: `1px solid ${r.isMember ? palette.accent + "40" : palette.amber + "40"}`,
+                    fontSize: 12, fontWeight: 600,
+                    fontFamily: "'Open Sans', sans-serif",
+                    maxWidth: "100%",
+                  }}
+                  title={r.isMember ? r.phone : `New number — ${r.phone}`}
+                >
+                  <span style={{
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>
+                    {r.name || r.phone}
+                  </span>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); removeRecipient(r.phone); }}
+                    style={{
+                      width: 18, height: 18, borderRadius: "50%",
+                      border: "none",
+                      background: r.isMember ? palette.accent : palette.amber,
+                      color: "#fff", fontSize: 12, lineHeight: 1,
+                      cursor: "pointer", padding: 0,
+                      display: "inline-flex", alignItems: "center", justifyContent: "center",
+                    }}
+                  >×</button>
+                </span>
+              ))}
+              <input
+                ref={inputRef}
+                type="text"
+                value={query}
+                onChange={(e) => { setQuery(e.target.value); setShowDropdown(true); setError(""); }}
+                onKeyDown={onInputKeyDown}
+                onFocus={() => setShowDropdown(true)}
+                onBlur={() => setTimeout(() => setShowDropdown(false), 150)}
+                placeholder={recipients.length === 0 ? "Add name or phone (e.g. 904-555-0102)" : "Add another…"}
                 style={{
-                  position: "absolute", right: 8, top: 32,
-                  background: "transparent", border: "none",
-                  color: palette.muted, fontSize: 16, cursor: "pointer",
-                  padding: "4px 8px",
+                  flex: 1, minWidth: 160, border: "none", outline: "none",
+                  fontSize: 14, fontFamily: "'Open Sans', sans-serif",
+                  color: palette.dark, padding: "4px 2px", background: "transparent",
                 }}
-              >×</button>
-            )}
-            {!picked && showDropdown && results.length > 0 && (
+              />
+            </div>
+
+            {showDropdown && (visibleResults.length > 0 || (query.trim() && looksLikePhoneFn(query))) && (
               <div style={{
                 position: "absolute", top: "100%", left: 0, right: 0,
                 background: palette.card, border: `1px solid ${palette.border}`,
                 borderRadius: 10, marginTop: 4, zIndex: 10,
-                maxHeight: 240, overflowY: "auto",
+                maxHeight: 260, overflowY: "auto",
                 boxShadow: palette.shadowHover,
               }}>
-                {results.slice(0, 20).map((m) => (
+                {query.trim() && looksLikePhoneFn(query) && !visibleResults.some((m) => m.phone === normalizeUsPhone(query)) && (
+                  <div
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => addFromQuery()}
+                    style={{
+                      padding: "10px 14px", cursor: "pointer",
+                      borderBottom: `1px solid ${palette.border}`,
+                      fontFamily: "'Open Sans', sans-serif",
+                      background: palette.amberLight + "60",
+                    }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600, color: palette.amber }}>
+                      + Use this number
+                    </div>
+                    <div style={{ fontSize: 11, color: palette.muted }}>
+                      {normalizeUsPhone(query)} — not a known member
+                    </div>
+                  </div>
+                )}
+                {visibleResults.slice(0, 20).map((m) => (
                   <div
                     key={m.phone}
                     onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => {
-                      setPicked({ phone: m.phone, name: m.name });
-                      setQuery("");
-                      setShowDropdown(false);
-                    }}
+                    onClick={() => addRecipient({ phone: m.phone, name: m.name, isMember: true })}
                     style={{
                       padding: "10px 14px", cursor: "pointer",
                       borderBottom: `1px solid ${palette.border}`,
@@ -2554,14 +2688,18 @@ function NewMessageModal({ onClose, onSent }) {
                 ))}
               </div>
             )}
-            {!picked && looksLikePhone && (
-              <div style={{
-                fontSize: 11, color: palette.muted, marginTop: 6,
-                fontFamily: "'Open Sans', sans-serif",
-              }}>
-                Will send to <strong style={{ color: palette.dark }}>{normalizedPhone}</strong> (not a known member — you'll be asked to confirm).
-              </div>
-            )}
+
+            <div style={{
+              fontSize: 11, color: palette.muted, marginTop: 6,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>
+              Press <strong>Enter</strong> or <strong>,</strong> to add. Pick from the list or type a 10-digit phone.
+              {newCount > 0 && (
+                <span style={{ color: palette.amber, marginLeft: 6 }}>
+                  · {newCount} new number{newCount === 1 ? "" : "s"}
+                </span>
+              )}
+            </div>
           </div>
 
           <div style={{ marginBottom: 16 }}>
@@ -2590,6 +2728,9 @@ function NewMessageModal({ onClose, onSent }) {
             }}>
               {body.length} char{body.length === 1 ? "" : "s"}
               {body.length > 0 && ` · ${Math.ceil(body.length / 160)} segment${Math.ceil(body.length / 160) === 1 ? "" : "s"}`}
+              {recipients.length > 0 && body.length > 0 && (
+                <> · {recipients.length * Math.ceil(body.length / 160)} total Twilio segment{recipients.length * Math.ceil(body.length / 160) === 1 ? "" : "s"} this send</>
+              )}
             </div>
           </div>
 
@@ -2629,59 +2770,79 @@ function NewMessageModal({ onClose, onSent }) {
               fontFamily: "'Open Sans', sans-serif",
             }}
           >
-            {sending ? "Sending…" : "Send"}
+            {sending
+              ? "Sending…"
+              : recipients.length > 1
+                ? `Send to ${recipients.length}`
+                : "Send"}
           </button>
         </div>
       </div>
 
-      {/* Confirm dialog for free-typed numbers */}
-      {pendingConfirm && (
-        <div style={{
-          position: "fixed", inset: 0, background: "rgba(11,37,69,0.55)",
-          zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center",
-        }}>
+      {/* Confirm dialog when any recipient is not a known member */}
+      {pendingConfirm && (() => {
+        const newOnes = recipients.filter((r) => !r.isMember);
+        return (
           <div style={{
-            background: palette.card, borderRadius: 14, padding: "22px 26px",
-            width: "min(420px, 92vw)", boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
+            position: "fixed", inset: 0, background: "rgba(11,37,69,0.55)",
+            zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center",
           }}>
             <div style={{
-              fontSize: 16, fontWeight: 700, color: palette.dark,
-              fontFamily: "'Montserrat', sans-serif", marginBottom: 8,
-            }}>Send to a new number?</div>
-            <div style={{
-              fontSize: 13, color: palette.muted, marginBottom: 16,
-              fontFamily: "'Open Sans', sans-serif", lineHeight: 1.5,
+              background: palette.card, borderRadius: 14, padding: "22px 26px",
+              width: "min(460px, 92vw)", boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
             }}>
-              <strong style={{ color: palette.dark }}>{normalizedPhone}</strong> isn't in your members list. Double-check the digits — once sent, this counts as an outbound SMS and can't be undone.
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
-              <button
-                onClick={() => setPendingConfirm(false)}
-                style={{
-                  padding: "8px 16px", borderRadius: 10,
-                  border: `1.5px solid ${palette.border}`, background: "transparent",
-                  color: palette.muted, fontSize: 13, fontWeight: 600,
-                  cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
-                }}
-              >Cancel</button>
-              <button
-                onClick={() => doSend(normalizedPhone)}
-                style={{
-                  padding: "8px 18px", borderRadius: 10, border: "none",
-                  background: palette.accent, color: "#fff",
-                  fontSize: 13, fontWeight: 600, cursor: "pointer",
-                  fontFamily: "'Open Sans', sans-serif",
-                }}
-              >Send</button>
+              <div style={{
+                fontSize: 16, fontWeight: 700, color: palette.dark,
+                fontFamily: "'Montserrat', sans-serif", marginBottom: 8,
+              }}>
+                Send to {recipients.length} recipient{recipients.length === 1 ? "" : "s"}?
+              </div>
+              <div style={{
+                fontSize: 13, color: palette.muted, marginBottom: 12,
+                fontFamily: "'Open Sans', sans-serif", lineHeight: 1.5,
+              }}>
+                {newOnes.length} {newOnes.length === 1 ? "number isn't" : "numbers aren't"} in your members list. Double-check before sending — outbound SMS can't be undone.
+              </div>
+              {newOnes.length > 0 && (
+                <div style={{
+                  background: palette.amberLight + "60", borderRadius: 10,
+                  padding: "8px 12px", marginBottom: 16, maxHeight: 120, overflowY: "auto",
+                  fontFamily: "'Open Sans', sans-serif", fontSize: 12, color: palette.dark,
+                }}>
+                  {newOnes.map((r) => (
+                    <div key={r.phone}>{r.phone}</div>
+                  ))}
+                </div>
+              )}
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button
+                  onClick={() => setPendingConfirm(false)}
+                  style={{
+                    padding: "8px 16px", borderRadius: 10,
+                    border: `1.5px solid ${palette.border}`, background: "transparent",
+                    color: palette.muted, fontSize: 13, fontWeight: 600,
+                    cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+                  }}
+                >Cancel</button>
+                <button
+                  onClick={doSend}
+                  style={{
+                    padding: "8px 18px", borderRadius: 10, border: "none",
+                    background: palette.accent, color: "#fff",
+                    fontSize: 13, fontWeight: 600, cursor: "pointer",
+                    fontFamily: "'Open Sans', sans-serif",
+                  }}
+                >Send to {recipients.length}</button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </>
   );
 }
 
-function ConversationsPanel({ onOpen }) {
+function ConversationsPanel({ onOpen, onToast }) {
   const [conversations, setConversations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -2908,9 +3069,18 @@ function ConversationsPanel({ onOpen }) {
       {composing && (
         <NewMessageModal
           onClose={() => setComposing(false)}
-          onSent={(phone) => {
+          onSent={(result) => {
             setComposing(false);
-            onOpen && onOpen(phone);
+            // Single recipient: jump into the thread. Multi: show a summary toast.
+            if (result.singleRecipientPhone && result.sent === 1) {
+              onOpen && onOpen(result.singleRecipientPhone);
+            } else {
+              const parts = [];
+              if (result.sent > 0) parts.push(`${result.sent} sent`);
+              if (result.failed > 0) parts.push(`${result.failed} failed`);
+              const summary = parts.length ? parts.join(", ") : "No messages sent";
+              onToast && onToast(`${summary} (of ${result.requested})`);
+            }
           }}
         />
       )}
@@ -3720,7 +3890,10 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
             </div>
           </div>
         ) : state.view === "conversations" ? (
-          <ConversationsPanel onOpen={(phone) => dispatch({ type: "OPEN_CONVERSATION", payload: phone })} />
+          <ConversationsPanel
+            onOpen={(phone) => dispatch({ type: "OPEN_CONVERSATION", payload: phone })}
+            onToast={(msg) => dispatch({ type: "SHOW_TOAST", payload: msg })}
+          />
         ) : state.view === "users" && me && me.user && me.user.role === "super_admin" ? (
           <UsersPanel palette={palette} />
         ) : state.view === "feedback" && me && me.user && me.user.role === "super_admin" ? (

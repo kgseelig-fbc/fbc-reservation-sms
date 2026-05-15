@@ -1283,6 +1283,90 @@ app.post("/api/sms/send-to-phone", requireAuth, requireFranchiseContext, async (
   }
 });
 
+// --- Bulk free-text SMS to multiple phones in the active franchise ---
+// Same body for everyone. Dedupes normalized phones, validates each, then
+// sends sequentially so a single Twilio error doesn't abort the run. Returns
+// per-recipient outcomes so the UI can surface partial failures.
+app.post("/api/sms/send-to-phones", requireAuth, requireFranchiseContext, async (req, res) => {
+  const rawPhones = Array.isArray(req.body?.phones) ? req.body.phones : [];
+  const body = String(req.body?.body || "").trim();
+  if (rawPhones.length === 0) return res.status(400).json({ error: "Missing phones" });
+  if (!body) return res.status(400).json({ error: "Message body is empty" });
+  if (body.length > 1600) return res.status(400).json({ error: "Message too long (max 1600 chars)" });
+  if (rawPhones.length > 200) return res.status(400).json({ error: "Too many recipients (max 200 per send)" });
+
+  const client = getTwilioClient(req.franchise);
+  if (!client) return res.status(400).json({ error: `Twilio is not configured for ${req.franchise.name}` });
+
+  // Normalize + dedupe before sending so we don't double-text someone whose
+  // phone appeared twice in the recipient list (autocomplete + raw entry).
+  const normalized = [];
+  const seen = new Set();
+  const invalid = [];
+  for (const raw of rawPhones) {
+    const p = normalizePhone(raw);
+    if (!p || p.replace(/\D/g, "").length < 10) {
+      invalid.push(raw);
+      continue;
+    }
+    if (seen.has(p)) continue;
+    seen.add(p);
+    normalized.push(p);
+  }
+
+  const statusCallback = req.franchise.base_url
+    ? `${req.franchise.base_url.replace(/\/+$/, "")}/api/sms/status`
+    : undefined;
+  const fromArgs = req.franchise.twilio_messaging_service_sid
+    ? { messagingServiceSid: req.franchise.twilio_messaging_service_sid }
+    : { from: req.franchise.twilio_phone_number };
+
+  const results = { sent: 0, failed: 0, errors: [] };
+  for (const toPhone of normalized) {
+    try {
+      const { rows: resvRows } = await db.query(
+        `SELECT id, dock_id, name, email FROM reservations
+          WHERE franchise_id = $1 AND phone = $2
+          ORDER BY reservation_date DESC NULLS LAST, created_at DESC
+          LIMIT 1`,
+        [req.franchiseId, toPhone]
+      );
+      const ctx = resvRows[0] || null;
+
+      const message = await client.messages.create({
+        body, to: toPhone, statusCallback, ...fromArgs,
+      });
+
+      await db.withTx(async (c) => {
+        await c.query(
+          `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status, sent_by_user_id)
+           VALUES ($1,$2,$3,$4,'out',$5,$6,$7,$8)`,
+          [
+            req.franchiseId, toPhone,
+            ctx ? ctx.id : null, ctx ? ctx.dock_id : null,
+            body, message.sid, message.status, req.session.userId,
+          ]
+        );
+        await upsertMember(c, req.franchiseId, toPhone, ctx ? ctx.name : null, ctx ? ctx.email : null);
+      });
+
+      results.sent++;
+    } catch (err) {
+      console.error(`send-to-phones failed for ${toPhone}:`, err.message);
+      results.failed++;
+      results.errors.push({ phone: toPhone, error: err.message });
+    }
+  }
+
+  res.json({
+    success: true,
+    requested: rawPhones.length,
+    deduped: normalized.length,
+    invalid: invalid.length,
+    ...results,
+  });
+});
+
 // --- Members directory (for the new-message composer's autocomplete) ---
 // Returns members of the active franchise, name+phone+email only. Search
 // is a case-insensitive substring match on name or phone digits.
