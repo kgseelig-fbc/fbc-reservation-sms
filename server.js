@@ -810,8 +810,9 @@ app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async
   try {
     const result = await db.withTx(async (c) => {
       const { rows: [batch] } = await c.query(
-        `INSERT INTO import_batches (franchise_id, dock_id, row_count) VALUES ($1,$2,$3) RETURNING id`,
-        [req.franchiseId, dockId, data.length]
+        `INSERT INTO import_batches (franchise_id, dock_id, row_count, uploaded_by_user_id)
+         VALUES ($1,$2,$3,$4) RETURNING id`,
+        [req.franchiseId, dockId, data.length, req.session.userId]
       );
       const batchId = batch.id;
       const prefix = dockId.toUpperCase().slice(0, 3);
@@ -846,6 +847,113 @@ app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async
   } catch (err) {
     console.error("Import error:", err);
     res.status(500).json({ error: "Import failed", details: err.message });
+  }
+});
+
+// --- Import history (read-only) ---
+// List prior uploads for this franchise, optionally filtered to one dock.
+// Each batch shows when it was imported, by whom, the row count, and
+// aggregate SMS outcome counts so staff can audit what happened to a batch.
+app.get("/api/import-batches", requireAuth, requireFranchiseContext, async (req, res) => {
+  const dockId = req.query.dock || null;
+  try {
+    const { rows } = await db.query(
+      `SELECT
+         b.id,
+         b.dock_id,
+         d.name AS dock_name,
+         b.imported_at,
+         b.row_count,
+         b.uploaded_by_user_id,
+         u.email AS uploaded_by_email,
+         u.name  AS uploaded_by_name,
+         (SELECT COUNT(*)::int FROM reservations r WHERE r.import_batch_id = b.id AND r.status = 'confirmed') AS confirmed_count,
+         (SELECT COUNT(*)::int FROM reservations r WHERE r.import_batch_id = b.id AND r.status = 'cancelled') AS cancelled_count,
+         (SELECT COUNT(*)::int FROM reservations r WHERE r.import_batch_id = b.id AND r.message_sent)        AS sent_count
+       FROM import_batches b
+       LEFT JOIN docks d ON d.id = b.dock_id
+       LEFT JOIN users u ON u.id = b.uploaded_by_user_id
+       WHERE b.franchise_id = $1
+         AND ($2::text IS NULL OR b.dock_id = $2)
+       ORDER BY b.imported_at DESC
+       LIMIT 200`,
+      [req.franchiseId, dockId]
+    );
+    res.json({ batches: rows });
+  } catch (err) {
+    console.error("List import batches error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Read-only snapshot of one batch: the reservations as they were imported,
+// plus any SMS exchanged with those phone numbers. Sending/editing is not
+// supported here — that's intentional, since acting on a stale batch could
+// re-SMS guests whose reservations have since changed.
+app.get("/api/import-batches/:id", requireAuth, requireFranchiseContext, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: "Invalid batch id" });
+  try {
+    const { rows: batchRows } = await db.query(
+      `SELECT b.*, d.name AS dock_name,
+              u.email AS uploaded_by_email,
+              u.name  AS uploaded_by_name
+         FROM import_batches b
+         LEFT JOIN docks d ON d.id = b.dock_id
+         LEFT JOIN users u ON u.id = b.uploaded_by_user_id
+        WHERE b.id = $1 AND b.franchise_id = $2`,
+      [id, req.franchiseId]
+    );
+    if (batchRows.length === 0) return res.status(404).json({ error: "Batch not found" });
+    const batch = batchRows[0];
+
+    const { rows: reservations } = await db.query(
+      `SELECT * FROM reservations
+        WHERE import_batch_id = $1 AND franchise_id = $2
+        ORDER BY reservation_date ASC NULLS LAST`,
+      [id, req.franchiseId]
+    );
+
+    const phones = [...new Set(reservations.map((r) => r.phone).filter(Boolean))];
+    const messagesByPhone = {};
+    if (phones.length > 0) {
+      const { rows: messages } = await db.query(
+        `SELECT * FROM messages
+         WHERE franchise_id = $1 AND phone = ANY($2::text[])
+         ORDER BY created_at ASC`,
+        [req.franchiseId, phones]
+      );
+      for (const m of messages) {
+        (messagesByPhone[m.phone] = messagesByPhone[m.phone] || []).push({
+          from: m.direction === "out" ? "system" : "member",
+          text: m.body,
+          time: m.created_at,
+          twilioSid: m.twilio_sid,
+          twilioStatus: m.twilio_status,
+          reservationId: m.reservation_id,
+        });
+      }
+    }
+
+    res.json({
+      batch: {
+        id: batch.id,
+        dockId: batch.dock_id,
+        dockName: batch.dock_name,
+        importedAt: batch.imported_at,
+        rowCount: batch.row_count,
+        uploadedBy: batch.uploaded_by_user_id
+          ? { id: batch.uploaded_by_user_id, email: batch.uploaded_by_email, name: batch.uploaded_by_name }
+          : null,
+      },
+      reservations: reservations.map((r) => ({
+        ...rowToReservation(r),
+        smsLog: messagesByPhone[r.phone] || [],
+      })),
+    });
+  } catch (err) {
+    console.error("Get import batch error:", err);
+    res.status(500).json({ error: "Database error" });
   }
 });
 

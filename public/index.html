@@ -269,6 +269,21 @@ const api = {
     });
     return res.json();
   },
+
+  async listImportBatches(dockId) {
+    const qs = dockId ? `?dock=${encodeURIComponent(dockId)}` : "";
+    const res = await fetch(`${API_BASE}/api/import-batches${qs}`, {
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async getImportBatch(id) {
+    const res = await fetch(`${API_BASE}/api/import-batches/${id}`, {
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
 };
 
 // ─── Excel Parsing ──────────────────────────────────────────────
@@ -461,6 +476,10 @@ function reducer(state, action) {
       return { ...state, conversationPhone: action.payload };
     case "CLOSE_CONVERSATION":
       return { ...state, conversationPhone: null };
+    case "OPEN_BATCH":
+      return { ...state, batchDetailId: action.payload };
+    case "CLOSE_BATCH":
+      return { ...state, batchDetailId: null };
     case "OPEN_COMPOSE":
       return { ...state, smsCompose: action.payload };
     case "CLOSE_COMPOSE":
@@ -1480,7 +1499,7 @@ function SmsOverlay({ onClose }) {
 }
 
 // ─── Upload Panel ────────────────────────────────────────────────
-function UploadPanel({ dispatch, dockName }) {
+function UploadPanel({ dispatch, dockName, dockId, onOpenBatch }) {
   const [step, setStep] = useState("upload"); // upload | mapping | preview
   const [dragOver, setDragOver] = useState(false);
   const [fileName, setFileName] = useState("");
@@ -1682,6 +1701,26 @@ function UploadPanel({ dispatch, dockName }) {
             * Required fields. Other columns are optional — we'll auto-detect matching headers.
           </div>
         </div>
+
+        {/* Past uploads for this dock */}
+        {dockId && (
+          <div style={{ marginTop: 32 }}>
+            <div style={{
+              display: "flex", justifyContent: "space-between", alignItems: "baseline",
+              marginBottom: 12,
+            }}>
+              <div style={{
+                fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 1,
+                textTransform: "uppercase", fontFamily: "'Open Sans', sans-serif",
+              }}>Past Uploads · {dockName}</div>
+              <div style={{
+                fontSize: 11, color: palette.muted,
+                fontFamily: "'Open Sans', sans-serif",
+              }}>Read-only — current reservations live in the Reservations tab.</div>
+            </div>
+            <BatchHistoryList dockId={dockId} onOpen={onOpenBatch} />
+          </div>
+        )}
       </div>
     );
   }
@@ -1864,6 +1903,367 @@ function UploadPanel({ dispatch, dockName }) {
   }
 
   return null;
+}
+
+// ─── Import History ─────────────────────────────────────────────
+// Renders a list of past Excel uploads. When `dockId` is set, the list is
+// scoped to that dock; when null it's a franchise-wide activity feed (and
+// the per-row dock name is shown).
+function BatchHistoryList({ dockId, onOpen, compact }) {
+  const [batches, setBatches] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    setBatches(null);
+    setError("");
+    (async () => {
+      try {
+        const data = await api.listImportBatches(dockId || null);
+        if (active) setBatches(data.batches || []);
+      } catch {
+        if (active) setError("Failed to load upload history");
+      }
+    })();
+    return () => { active = false; };
+  }, [dockId]);
+
+  if (batches === null && !error) {
+    return (
+      <div style={{
+        padding: 24, textAlign: "center", color: palette.muted,
+        fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+      }}>Loading history…</div>
+    );
+  }
+  if (error) {
+    return (
+      <div style={{
+        padding: 16, color: palette.red, fontSize: 13,
+        fontFamily: "'Open Sans', sans-serif",
+      }}>{error}</div>
+    );
+  }
+  if (batches.length === 0) {
+    return (
+      <div style={{
+        padding: "32px 20px", textAlign: "center", color: palette.muted,
+        fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+        background: palette.card, borderRadius: 12,
+        border: `1px solid ${palette.border}`,
+      }}>
+        <div style={{ fontSize: 30, opacity: 0.4, marginBottom: 8 }}>📭</div>
+        No uploads yet{dockId ? " for this dock" : ""}.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      background: palette.card, borderRadius: 12,
+      border: `1px solid ${palette.border}`, overflow: "hidden",
+      boxShadow: palette.shadow,
+    }}>
+      {batches.map((b, idx) => {
+        const dt = b.imported_at ? new Date(b.imported_at) : null;
+        const when = dt
+          ? dt.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) +
+            " · " + dt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+          : "—";
+        const who = b.uploaded_by_name || b.uploaded_by_email || "Unknown";
+        return (
+          <div
+            key={b.id}
+            onClick={() => onOpen && onOpen(b.id)}
+            style={{
+              display: "flex", alignItems: "center", gap: 16,
+              padding: "14px 18px", cursor: "pointer",
+              borderBottom: idx === batches.length - 1 ? "none" : `1px solid ${palette.border}`,
+              transition: "background 0.12s",
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.background = "#F5F8FB"}
+            onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+          >
+            <div style={{
+              width: 40, height: 40, borderRadius: 10,
+              background: palette.accentLight, color: palette.accent,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 16, flexShrink: 0,
+            }}>📊</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{
+                fontWeight: 600, fontSize: 14, color: palette.dark,
+                fontFamily: "'Open Sans', sans-serif", marginBottom: 2,
+              }}>
+                {when}
+                {!dockId && b.dock_name && (
+                  <span style={{
+                    marginLeft: 8, fontSize: 11, fontWeight: 600,
+                    padding: "2px 8px", borderRadius: 6,
+                    background: palette.blueLight, color: palette.dark,
+                  }}>{b.dock_name}</span>
+                )}
+              </div>
+              <div style={{
+                fontSize: 12, color: palette.muted,
+                fontFamily: "'Open Sans', sans-serif",
+              }}>
+                {b.row_count} reservation{b.row_count === 1 ? "" : "s"} · uploaded by {who}
+              </div>
+            </div>
+            {!compact && (
+              <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <span style={{
+                  fontSize: 11, padding: "3px 9px", borderRadius: 6,
+                  background: palette.greenLight, color: palette.green, fontWeight: 600,
+                  fontFamily: "'Open Sans', sans-serif",
+                }}>✓ {b.confirmed_count} confirmed</span>
+                <span style={{
+                  fontSize: 11, padding: "3px 9px", borderRadius: 6,
+                  background: palette.redLight, color: palette.red, fontWeight: 600,
+                  fontFamily: "'Open Sans', sans-serif",
+                }}>✕ {b.cancelled_count} cancelled</span>
+                <span style={{
+                  fontSize: 11, padding: "3px 9px", borderRadius: 6,
+                  background: "#F0EEEA", color: palette.muted, fontWeight: 600,
+                  fontFamily: "'Open Sans', sans-serif",
+                }}>✉ {b.sent_count} SMS sent</span>
+              </div>
+            )}
+            <span style={{
+              color: palette.muted, fontSize: 18, marginLeft: 6, flexShrink: 0,
+            }}>›</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Activity (cross-dock) ─────────────────────────────────────
+function ActivityPanel({ onOpen }) {
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{
+          fontSize: 22, fontWeight: 700, color: palette.dark,
+          fontFamily: "'Montserrat', sans-serif", marginBottom: 4,
+        }}>Upload Activity</h2>
+        <p style={{
+          fontSize: 13, color: palette.muted, fontFamily: "'Open Sans', sans-serif",
+        }}>
+          Every Excel upload across all docks. Click an entry to see the reservations and SMS log from that import.
+        </p>
+      </div>
+      <BatchHistoryList dockId={null} onOpen={onOpen} />
+    </div>
+  );
+}
+
+// ─── Batch Detail Drawer (read-only snapshot) ─────────────────
+// Renders the reservations from one past upload along with any SMS that
+// went to those phones. No send/cancel/edit controls — acting on a stale
+// batch could re-SMS guests whose current reservation differs.
+function BatchDetailDrawer({ batchId, onClose }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [expandedId, setExpandedId] = useState(null);
+
+  useEffect(() => {
+    let active = true;
+    setData(null);
+    setError("");
+    (async () => {
+      try {
+        const r = await api.getImportBatch(batchId);
+        if (!active) return;
+        if (r.error) setError(r.error);
+        else setData(r);
+      } catch {
+        if (active) setError("Failed to load batch");
+      }
+    })();
+    return () => { active = false; };
+  }, [batchId]);
+
+  const batch = data && data.batch;
+  const reservations = data && data.reservations || [];
+  const when = batch && batch.importedAt
+    ? new Date(batch.importedAt).toLocaleDateString("en-US", { weekday: "short", month: "long", day: "numeric", year: "numeric" }) +
+      " · " + new Date(batch.importedAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+    : "—";
+  const who = batch && batch.uploadedBy
+    ? (batch.uploadedBy.name || batch.uploadedBy.email)
+    : "Unknown";
+
+  return (
+    <>
+      <div
+        onClick={onClose}
+        style={{
+          position: "fixed", inset: 0, background: "rgba(11,37,69,0.4)",
+          zIndex: 999, animation: "fadeIn 0.2s",
+        }}
+      />
+      <div style={{
+        position: "fixed", top: 0, right: 0, bottom: 0,
+        width: "min(720px, 100%)", background: palette.bg,
+        zIndex: 1000, boxShadow: "-8px 0 32px rgba(0,0,0,0.15)",
+        display: "flex", flexDirection: "column",
+        animation: "slideIn 0.25s ease-out",
+      }}>
+        <style>{`@keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }`}</style>
+        {/* Header */}
+        <div style={{
+          padding: "18px 24px", background: palette.card,
+          borderBottom: `1px solid ${palette.border}`,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          flexShrink: 0,
+        }}>
+          <div>
+            <div style={{
+              fontSize: 10, color: palette.accent, fontWeight: 700,
+              letterSpacing: 1.5, textTransform: "uppercase",
+              fontFamily: "'Open Sans', sans-serif", marginBottom: 2,
+            }}>Read-Only Snapshot</div>
+            <div style={{
+              fontSize: 17, fontWeight: 700, color: palette.dark,
+              fontFamily: "'Montserrat', sans-serif",
+            }}>
+              {batch ? `${batch.dockName || batch.dockId} · ${when}` : "Loading batch…"}
+            </div>
+            {batch && (
+              <div style={{
+                fontSize: 12, color: palette.muted, marginTop: 3,
+                fontFamily: "'Open Sans', sans-serif",
+              }}>
+                {batch.rowCount} reservation{batch.rowCount === 1 ? "" : "s"} · uploaded by {who}
+              </div>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            style={{
+              background: "transparent", border: `1.5px solid ${palette.border}`,
+              borderRadius: 10, padding: "8px 14px", cursor: "pointer",
+              color: palette.muted, fontSize: 13, fontWeight: 600,
+              fontFamily: "'Open Sans', sans-serif",
+            }}
+          >Close ×</button>
+        </div>
+
+        {/* Body */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+          {error && (
+            <div style={{
+              padding: 16, borderRadius: 12, background: palette.redLight,
+              color: palette.red, fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+            }}>{error}</div>
+          )}
+          {!data && !error && (
+            <div style={{ padding: 40, textAlign: "center", color: palette.muted }}>Loading…</div>
+          )}
+          {data && reservations.length === 0 && (
+            <div style={{
+              padding: "40px 20px", textAlign: "center", color: palette.muted,
+              fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+            }}>This batch has no reservations.</div>
+          )}
+          {data && reservations.map((res) => {
+            const resDate = res.date ? new Date(res.date) : null;
+            const dateStr = resDate
+              ? resDate.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })
+              : "—";
+            const timeStr = resDate
+              ? resDate.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+              : "";
+            const isOpen = expandedId === res.id;
+            return (
+              <div
+                key={res.id}
+                onClick={() => setExpandedId(isOpen ? null : res.id)}
+                style={{
+                  background: palette.card, borderRadius: 12,
+                  border: `1px solid ${palette.border}`, marginBottom: 8,
+                  padding: "14px 16px", cursor: "pointer",
+                  boxShadow: palette.shadow,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{
+                      fontWeight: 600, fontSize: 14, color: palette.dark,
+                      fontFamily: "'Open Sans', sans-serif",
+                    }}>
+                      {res.name || "Guest"}
+                      <span style={{
+                        marginLeft: 8, fontSize: 11, color: palette.muted, fontWeight: 500,
+                      }}>{res.phone || "no phone"}</span>
+                    </div>
+                    <div style={{
+                      fontSize: 12, color: palette.muted, marginTop: 2,
+                      fontFamily: "'Open Sans', sans-serif",
+                    }}>
+                      {dateStr} {timeStr && `· ${timeStr}`} · {res.service || "Reservation"} · {res.guests || 1} guest{(res.guests || 1) === 1 ? "" : "s"}
+                    </div>
+                  </div>
+                  <StatusBadge status={res.status || "unconfirmed"} />
+                  <span style={{
+                    fontSize: 11, padding: "3px 9px", borderRadius: 6,
+                    background: res.messageSent ? palette.greenLight : "#F0EEEA",
+                    color: res.messageSent ? palette.green : palette.muted,
+                    fontWeight: 600, fontFamily: "'Open Sans', sans-serif",
+                  }}>
+                    {res.messageSent ? "SMS sent" : "Not messaged"}
+                  </span>
+                </div>
+                {isOpen && (res.smsLog && res.smsLog.length > 0) && (
+                  <div style={{
+                    marginTop: 12, paddingTop: 12,
+                    borderTop: `1px solid ${palette.border}`,
+                    display: "flex", flexDirection: "column", gap: 6,
+                  }} onClick={(e) => e.stopPropagation()}>
+                    {res.smsLog.map((m, i) => {
+                      const mt = m.time ? new Date(m.time) : null;
+                      const tlabel = mt
+                        ? mt.toLocaleDateString("en-US", { month: "short", day: "numeric" }) +
+                          " " + mt.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+                        : "";
+                      const inbound = m.from !== "system";
+                      return (
+                        <div key={i} style={{
+                          alignSelf: inbound ? "flex-start" : "flex-end",
+                          maxWidth: "85%",
+                          background: inbound ? palette.blueLight : palette.accentLight,
+                          color: palette.dark,
+                          padding: "8px 12px", borderRadius: 10,
+                          fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+                          whiteSpace: "pre-wrap",
+                        }}>
+                          {m.text}
+                          <div style={{
+                            fontSize: 10, color: palette.muted, marginTop: 4,
+                          }}>{tlabel}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {isOpen && (!res.smsLog || res.smsLog.length === 0) && (
+                  <div style={{
+                    marginTop: 10, paddingTop: 10,
+                    borderTop: `1px solid ${palette.border}`,
+                    fontSize: 12, color: palette.muted,
+                    fontFamily: "'Open Sans', sans-serif",
+                  }}>No SMS exchanged on this phone.</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
 }
 
 // ─── Bulk Action Bar ─────────────────────────────────────────────
@@ -2409,6 +2809,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
     currentDock: null, // dock id
     view: "dock-select", // start at dock selection
     conversationPhone: null, // phone of the conversation drawer (if open)
+    batchDetailId: null, // import_batches.id for the read-only batch detail modal
     showToast: null,
   });
 
@@ -2732,6 +3133,16 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
                 fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
               }}
             >Automation</button>
+            <button
+              onClick={() => dispatch({ type: "SET_VIEW", payload: "activity" })}
+              style={{
+                padding: "10px 22px", borderRadius: 10, border: "none",
+                background: state.view === "activity" ? palette.dark : "transparent",
+                color: state.view === "activity" ? "#fff" : palette.muted,
+                fontSize: 13, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+              }}
+            >Activity</button>
             {me && me.user && me.user.role === "super_admin" && (
               <button
                 onClick={() => dispatch({ type: "SET_VIEW", payload: "users" })}
@@ -2883,12 +3294,16 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           <AdminFeedbackPanel palette={palette} />
         ) : state.view === "upload" || (state.view === "reservations" && state.reservations.length === 0) ? (
           <UploadPanel
+            dockId={state.currentDock}
             dockName={DOCKS.find((d) => d.id === state.currentDock)?.name || ""}
+            onOpenBatch={(id) => dispatch({ type: "OPEN_BATCH", payload: id })}
             dispatch={(action) => {
               liveDispatch(action);
               if (action.type === "LOAD_DATA") dispatch({ type: "SET_VIEW", payload: "reservations" });
             }}
           />
+        ) : state.view === "activity" ? (
+          <ActivityPanel onOpen={(id) => dispatch({ type: "OPEN_BATCH", payload: id })} />
         ) : state.view === "reservations" ? (
           <>
             {/* Stats */}
@@ -3073,6 +3488,14 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
             onClose={() => dispatch({ type: "CLOSE_CONVERSATION" })}
           />
         </>
+      )}
+
+      {/* Batch Detail Drawer (read-only snapshot of a past upload) */}
+      {state.batchDetailId && (
+        <BatchDetailDrawer
+          batchId={state.batchDetailId}
+          onClose={() => dispatch({ type: "CLOSE_BATCH" })}
+        />
       )}
 
       {/* SMS Compose Modal */}
