@@ -247,6 +247,22 @@ const api = {
     return res.json();
   },
 
+  async approveTimeChange(id) {
+    const res = await fetch(`${API_BASE}/api/reservations/${id}/approve-time-change`, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async rejectTimeChange(id) {
+    const res = await fetch(`${API_BASE}/api/reservations/${id}/reject-time-change`, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
   async healthCheck() {
     const res = await fetch(`${API_BASE}/api/health`, {
       credentials: "same-origin",
@@ -439,6 +455,9 @@ function reducer(state, action) {
     case "CLOSE_SMS":
       return { ...state, smsDrawer: null };
     case "OPEN_CONVERSATION":
+      // Mark as read locally so the nav badge clears this conversation on
+      // the next poll (within ~10s).
+      try { localStorage.setItem(`conv_read_${action.payload}`, new Date().toISOString()); } catch {}
       return { ...state, conversationPhone: action.payload };
     case "CLOSE_CONVERSATION":
       return { ...state, conversationPhone: null };
@@ -784,8 +803,61 @@ function ReservationRow({ res, isSelected, isChecked, dispatch }) {
         </div>
 
         {/* Status */}
-        <StatusBadge status={res.status} />
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {res.pendingTimeChange && (
+            <span title="Customer requested a new arrival time — review below" style={{
+              fontSize: 11, padding: "3px 8px", borderRadius: 6,
+              background: palette.amberLight, color: palette.amber,
+              fontWeight: 700, fontFamily: "'Open Sans', sans-serif",
+              border: `1px solid ${palette.amber}40`,
+            }}>⏰ TIME CHANGE</span>
+          )}
+          <StatusBadge status={res.status} />
+        </div>
       </div>
+
+      {/* Pending time-change banner — surfaced prominently when set */}
+      {res.pendingTimeChange && (
+        <div style={{
+          marginTop: 12, padding: "12px 16px",
+          background: palette.amberLight, borderRadius: 10,
+          border: `1px solid ${palette.amber}40`,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          gap: 12, flexWrap: "wrap",
+        }}>
+          <div style={{ fontSize: 13, color: palette.dark, fontFamily: "'Open Sans', sans-serif" }}>
+            Customer requested <strong>{new Date(res.pendingTimeChange).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</strong> instead of the current time.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={async (e) => {
+                e.stopPropagation();
+                const r = await api.approveTimeChange(res.id);
+                if (r.success) dispatch({ type: "REFRESH" });
+              }}
+              style={{
+                padding: "6px 14px", borderRadius: 8, border: "none",
+                background: palette.green, color: "#fff", fontSize: 12,
+                fontWeight: 600, cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+              }}
+            >Approve</button>
+            <button
+              onClick={async (e) => {
+                e.stopPropagation();
+                if (!confirm("Reject this time-change request? The customer will be told the time isn't available.")) return;
+                const r = await api.rejectTimeChange(res.id);
+                if (r.success) dispatch({ type: "REFRESH" });
+              }}
+              style={{
+                padding: "6px 14px", borderRadius: 8,
+                border: `1.5px solid ${palette.red}`, background: "transparent",
+                color: palette.red, fontSize: 12, fontWeight: 600,
+                cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+              }}
+            >Reject</button>
+          </div>
+        </div>
+      )}
 
       {/* Expanded Detail */}
       {isSelected && (
@@ -1889,6 +1961,7 @@ function ConversationsPanel({ onOpen }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("unread"); // unread | newest | oldest | name
 
   useEffect(() => {
     let active = true;
@@ -1912,13 +1985,40 @@ function ConversationsPanel({ onOpen }) {
 
   const dockName = (id) => (DOCKS.find((d) => d.id === id) || {}).name || id || "—";
 
-  const filtered = conversations.filter((c) => {
-    if (!search) return true;
-    const s = search.toLowerCase();
-    return (c.phone || "").toLowerCase().includes(s) ||
-           (c.name || "").toLowerCase().includes(s) ||
-           (c.last_message_body || "").toLowerCase().includes(s);
-  });
+  // A conversation is "unread" when the most recent message is inbound AND
+  // its timestamp is newer than the localStorage read-mark for that phone.
+  const isUnread = (c) => {
+    if (c.last_direction !== "in") return false;
+    const readStr = localStorage.getItem(`conv_read_${c.phone}`);
+    const readAt = readStr ? new Date(readStr).getTime() : 0;
+    return new Date(c.last_message_at).getTime() > readAt;
+  };
+
+  const filtered = conversations
+    .filter((c) => {
+      if (!search) return true;
+      const s = search.toLowerCase();
+      return (c.phone || "").toLowerCase().includes(s) ||
+             (c.name || "").toLowerCase().includes(s) ||
+             (c.last_message_body || "").toLowerCase().includes(s);
+    })
+    .sort((a, b) => {
+      const aTime = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
+      const bTime = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
+      switch (sortBy) {
+        case "newest": return bTime - aTime;
+        case "oldest": return aTime - bTime;
+        case "name": return (a.name || a.phone || "").localeCompare(b.name || b.phone || "");
+        case "unread":
+        default: {
+          // Unread first, then newest within each group
+          const aU = isUnread(a) ? 1 : 0;
+          const bU = isUnread(b) ? 1 : 0;
+          if (aU !== bU) return bU - aU;
+          return bTime - aTime;
+        }
+      }
+    });
 
   return (
     <div>
@@ -1939,6 +2039,21 @@ function ConversationsPanel({ onOpen }) {
             outline: "none",
           }}
         />
+        <select
+          value={sortBy}
+          onChange={(e) => setSortBy(e.target.value)}
+          style={{
+            padding: "10px 14px", borderRadius: 10,
+            border: `1.5px solid ${palette.border}`, background: palette.card,
+            fontSize: 13, fontFamily: "'Open Sans', sans-serif", color: palette.dark,
+            outline: "none", cursor: "pointer",
+          }}
+        >
+          <option value="unread">Unread first</option>
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="name">Name A–Z</option>
+        </select>
         <div style={{ color: palette.muted, fontSize: 12, fontFamily: "'Open Sans', sans-serif" }}>
           {filtered.length} conversation{filtered.length === 1 ? "" : "s"}
         </div>
@@ -1971,6 +2086,7 @@ function ConversationsPanel({ onOpen }) {
               : "";
             const preview = (c.last_message_body || "").replace(/\s+/g, " ").slice(0, 120);
             const inbound = c.last_direction === "in";
+            const unread = isUnread(c);
             return (
               <div
                 key={c.phone}
@@ -1979,11 +2095,19 @@ function ConversationsPanel({ onOpen }) {
                   display: "flex", alignItems: "center", gap: 14,
                   padding: "14px 18px", cursor: "pointer",
                   borderBottom: idx === filtered.length - 1 ? "none" : `1px solid ${palette.border}`,
+                  background: unread ? "#FFF7E6" : "transparent",
                   transition: "background 0.12s",
+                  position: "relative",
                 }}
-                onMouseEnter={(e) => e.currentTarget.style.background = "#F5F8FB"}
-                onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                onMouseEnter={(e) => e.currentTarget.style.background = unread ? "#FFEFCC" : "#F5F8FB"}
+                onMouseLeave={(e) => e.currentTarget.style.background = unread ? "#FFF7E6" : "transparent"}
               >
+                {unread && (
+                  <div title="Unread reply" style={{
+                    position: "absolute", left: 6, top: "50%", transform: "translateY(-50%)",
+                    width: 8, height: 8, borderRadius: "50%", background: palette.red,
+                  }} />
+                )}
                 <div style={{
                   width: 42, height: 42, borderRadius: "50%",
                   background: `linear-gradient(135deg, ${palette.accent}20, ${palette.accent}40)`,
@@ -2057,6 +2181,9 @@ function ConversationDrawer({ phone, onClose }) {
       try {
         const result = await api.getConversation(phone);
         if (active) setData(result);
+        // Re-mark as read on every refresh so a new inbound message arriving
+        // while the drawer is open doesn't transiently re-flag it as unread.
+        try { localStorage.setItem(`conv_read_${phone}`, new Date().toISOString()); } catch {}
       } catch {
         if (active) setError("Failed to load conversation");
       }
@@ -2286,6 +2413,34 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
   });
 
   const [apiStatus, setApiStatus] = useState(api.isLive() ? "connecting" : "local"); // local | connecting | connected | error
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  // App-wide poll for conversation unread count. Runs regardless of which
+  // view the user is on, so the nav badge stays current. "Read" state is
+  // tracked in localStorage per phone — a conversation is unread when the
+  // last inbound message is newer than the locally stored read timestamp.
+  useEffect(() => {
+    if (!api.isLive()) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const data = await api.listConversations();
+        if (!active) return;
+        const convos = data.conversations || [];
+        const count = convos.filter((c) => {
+          if (c.last_direction !== "in") return false;
+          const lastAt = new Date(c.last_message_at).getTime();
+          const readStr = localStorage.getItem(`conv_read_${c.phone}`);
+          const readAt = readStr ? new Date(readStr).getTime() : 0;
+          return lastAt > readAt;
+        }).length;
+        setUnreadCount(count);
+      } catch { /* silently fail */ }
+    };
+    poll();
+    const interval = setInterval(poll, 10000);
+    return () => { active = false; clearInterval(interval); };
+  }, []);
 
   // Poll the backend API for reservation updates when in live mode
   useEffect(() => {
@@ -2437,6 +2592,10 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
         }
         break;
       }
+      case "REFRESH": {
+        await refreshFromServer();
+        break;
+      }
       case "SIMULATE_REPLY": {
         try {
           await api.simulateReply(action.payload.id, action.payload.reply, state.currentDock);
@@ -2550,8 +2709,19 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
                 color: state.view === "conversations" ? "#fff" : palette.muted,
                 fontSize: 13, fontWeight: 600, cursor: "pointer",
                 fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+                position: "relative",
               }}
-            >Conversations</button>
+            >Conversations
+              {unreadCount > 0 && (
+                <span style={{
+                  marginLeft: 6, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                  minWidth: 18, height: 18, padding: "0 5px",
+                  borderRadius: 9, background: palette.red, color: "#fff",
+                  fontSize: 11, fontWeight: 700, fontFamily: "'Open Sans', sans-serif",
+                  fontVariantNumeric: "tabular-nums",
+                }}>{unreadCount}</span>
+              )}
+            </button>
             <button
               onClick={() => dispatch({ type: "SET_VIEW", payload: "automation" })}
               style={{

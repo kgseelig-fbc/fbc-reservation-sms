@@ -707,6 +707,7 @@ function rowToReservation(r) {
     messageTime: r.message_time,
     timeUpdated: !!r.time_updated,
     originalTime: r.original_time,
+    pendingTimeChange: r.pending_time_change || null,
     dock: r.dock_id,
     sourceId: r.source_id,
     franchiseId: r.franchise_id,
@@ -862,6 +863,78 @@ app.post("/api/reservations/:id/status", requireAuth, requireFranchiseContext, a
     res.json({ success: true, reservation: rowToReservation(rows[0]) });
   } catch (err) {
     console.error("Status update error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Approve a customer-proposed time change: move pending_time_change into
+// reservation_date (backing up the original), clear the pending column, and
+// SMS the customer to confirm. Staff invokes this from the dashboard.
+app.post("/api/reservations/:id/approve-time-change", requireAuth, requireFranchiseContext, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
+      [id, req.franchiseId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
+    const reservation = rows[0];
+    if (!reservation.pending_time_change) {
+      return res.status(400).json({ error: "No pending time change on this reservation" });
+    }
+    const originalTime = reservation.original_time || reservation.reservation_date;
+    const { rows: updated } = await db.query(
+      `UPDATE reservations
+       SET reservation_date = $1,
+           time_updated = TRUE,
+           original_time = COALESCE(original_time, $2),
+           pending_time_change = NULL,
+           status = 'confirmed'
+       WHERE id = $3
+       RETURNING *`,
+      [reservation.pending_time_change, originalTime, id]
+    );
+    const newTimeStr = new Date(reservation.pending_time_change).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    try {
+      await sendAndLogSms(req.franchise, updated[0],
+        `Great news! Your new arrival time of ${newTimeStr} is confirmed. See you then!`);
+    } catch (err) {
+      console.error("Approve time-change SMS error:", err.message);
+    }
+    res.json({ success: true, reservation: rowToReservation(updated[0]) });
+  } catch (err) {
+    console.error("Approve time-change error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/reservations/:id/reject-time-change", requireAuth, requireFranchiseContext, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
+      [id, req.franchiseId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
+    const reservation = rows[0];
+    if (!reservation.pending_time_change) {
+      return res.status(400).json({ error: "No pending time change on this reservation" });
+    }
+    const requestedTimeStr = new Date(reservation.pending_time_change).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    const originalTimeStr = new Date(reservation.reservation_date).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+    const { rows: updated } = await db.query(
+      `UPDATE reservations SET pending_time_change = NULL WHERE id = $1 RETURNING *`,
+      [id]
+    );
+    try {
+      await sendAndLogSms(req.franchise, updated[0],
+        `Sorry — ${requestedTimeStr} isn't available. Your reservation remains at ${originalTimeStr}. Reply YES to confirm or CANCEL if you can't make it.`);
+    } catch (err) {
+      console.error("Reject time-change SMS error:", err.message);
+    }
+    res.json({ success: true, reservation: rowToReservation(updated[0]) });
+  } catch (err) {
+    console.error("Reject time-change error:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -1073,19 +1146,19 @@ async function applyConfirm(reservation) {
   return CONFIRM_RESPONSE;
 }
 
-async function applyTimeChange(reservation, hour, minute) {
+// We don't have an availability source of truth — the FBC booking system
+// is external — so we never auto-apply a time change. Instead we record the
+// proposed time on the reservation row and surface it in the dashboard for
+// staff to approve or reject. The customer gets a "we'll check" reply.
+async function flagTimeChangeRequest(reservation, hour, minute) {
   const dateObj = new Date(reservation.reservation_date);
-  const originalTime = reservation.original_time || reservation.reservation_date;
   dateObj.setHours(hour, minute, 0, 0);
   await db.query(
-    `UPDATE reservations
-     SET reservation_date = $1, time_updated = TRUE,
-         original_time = COALESCE(original_time, $2)
-     WHERE id = $3`,
-    [dateObj.toISOString(), originalTime, reservation.id]
+    `UPDATE reservations SET pending_time_change = $1 WHERE id = $2`,
+    [dateObj.toISOString(), reservation.id]
   );
   const newTimeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-  return `Got it! Your arrival time has been updated to ${newTimeStr}. Just reply YES to confirm your reservation.`;
+  return `Thanks! We'll check availability for ${newTimeStr} and confirm shortly.`;
 }
 
 async function parseAndApplyReply(inboundText, reservation) {
@@ -1122,7 +1195,7 @@ async function parseAndApplyReply(inboundText, reservation) {
         return applyConfirm(reservation);
       case "time_change":
         if (Number.isInteger(llm.hour) && Number.isInteger(llm.minute)) {
-          return applyTimeChange(reservation, llm.hour, llm.minute);
+          return flagTimeChangeRequest(reservation, llm.hour, llm.minute);
         }
         break;
       case "handoff":
@@ -1142,7 +1215,7 @@ async function parseAndApplyReply(inboundText, reservation) {
     const ampm = timeMatch[3];
     if (ampm && ampm.toLowerCase() === "pm" && h < 12) h += 12;
     if (ampm && ampm.toLowerCase() === "am" && h === 12) h = 0;
-    return applyTimeChange(reservation, h, m);
+    return flagTimeChangeRequest(reservation, h, m);
   }
   if (handoffOrInquiry.test(replyLower) || inboundText.includes("?")) {
     return HANDOFF_RESPONSE;
