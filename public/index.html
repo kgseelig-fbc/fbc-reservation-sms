@@ -270,6 +270,24 @@ const api = {
     return res.json();
   },
 
+  async listMembers(q) {
+    const qs = q ? `?q=${encodeURIComponent(q)}` : "";
+    const res = await fetch(`${API_BASE}/api/members${qs}`, {
+      credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async sendToPhone(phone, body) {
+    const res = await fetch(`${API_BASE}/api/sms/send-to-phone`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ phone, body }),
+    });
+    return res.json();
+  },
+
   async listImportBatches(dockId) {
     const qs = dockId ? `?dock=${encodeURIComponent(dockId)}` : "";
     const res = await fetch(`${API_BASE}/api/import-batches${qs}`, {
@@ -2356,12 +2374,320 @@ function BulkActionBar({ count, dispatch, reservations, selected }) {
 }
 
 // ─── Conversations Panel ─────────────────────────────────────────
+// ─── New Message composer ─────────────────────────────────────
+// Compose modal launched from the Conversations page. Recipient field
+// autocompletes against /api/members (search-as-you-type), but also accepts
+// a raw phone for someone who isn't a member yet. Free-typed numbers go
+// through a confirm step before send.
+function NewMessageModal({ onClose, onSent }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+  const [showDropdown, setShowDropdown] = useState(false);
+  const [picked, setPicked] = useState(null); // {phone, name} when chosen from autocomplete
+  const [body, setBody] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState("");
+  const [pendingConfirm, setPendingConfirm] = useState(false);
+
+  // Search-as-you-type with a short debounce. We always query because even
+  // an empty string returns recent members (handy when the user just wants
+  // a list).
+  useEffect(() => {
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        const r = await api.listMembers(query);
+        if (!cancelled) setResults(r.members || []);
+      } catch {
+        if (!cancelled) setResults([]);
+      }
+    }, 180);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [query]);
+
+  const normalizedPhone = (() => {
+    // Mirror the server's normalizePhone for the confirm dialog preview.
+    let digits = query.replace(/\D/g, "");
+    if (digits.length === 10) return `+1${digits}`;
+    if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+    return query.startsWith("+") ? query : (digits ? `+${digits}` : "");
+  })();
+  const looksLikePhone = query.replace(/\D/g, "").length >= 10;
+  const canSend = (picked || looksLikePhone) && body.trim().length > 0 && !sending;
+
+  const initiateSend = () => {
+    setError("");
+    if (!canSend) return;
+    if (picked) {
+      // Known member: send directly.
+      doSend(picked.phone);
+    } else {
+      // Free-typed number: require explicit confirm.
+      setPendingConfirm(true);
+    }
+  };
+
+  const doSend = async (phone) => {
+    setSending(true);
+    setPendingConfirm(false);
+    try {
+      const r = await api.sendToPhone(phone, body.trim());
+      if (r.success) {
+        onSent && onSent(r.phone || phone);
+      } else {
+        setError(r.error || "Failed to send");
+      }
+    } catch {
+      setError("Network error");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <>
+      <div
+        onClick={onClose}
+        style={{
+          position: "fixed", inset: 0, background: "rgba(11,37,69,0.4)",
+          zIndex: 1000, animation: "fadeIn 0.2s",
+        }}
+      />
+      <div
+        style={{
+          position: "fixed", top: "50%", left: "50%",
+          transform: "translate(-50%, -50%)",
+          width: "min(520px, 92vw)", background: palette.card,
+          borderRadius: 16, zIndex: 1001,
+          boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
+          display: "flex", flexDirection: "column", maxHeight: "90vh",
+        }}
+      >
+        <div style={{
+          padding: "18px 22px", borderBottom: `1px solid ${palette.border}`,
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+        }}>
+          <div style={{
+            fontSize: 17, fontWeight: 700, color: palette.dark,
+            fontFamily: "'Montserrat', sans-serif",
+          }}>New Message</div>
+          <button
+            onClick={onClose}
+            style={{
+              background: "transparent", border: "none",
+              fontSize: 22, color: palette.muted, cursor: "pointer",
+              padding: 0, lineHeight: 1,
+            }}
+          >×</button>
+        </div>
+
+        <div style={{ padding: "18px 22px", overflowY: "auto" }}>
+          <div style={{ position: "relative", marginBottom: 16 }}>
+            <label style={{
+              display: "block", fontSize: 11, fontWeight: 600,
+              color: palette.muted, letterSpacing: 0.5,
+              textTransform: "uppercase", marginBottom: 6,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>To</label>
+            <input
+              type="text"
+              value={picked ? `${picked.name || picked.phone} · ${picked.phone}` : query}
+              onChange={(e) => {
+                setPicked(null);
+                setQuery(e.target.value);
+                setShowDropdown(true);
+              }}
+              onFocus={() => setShowDropdown(true)}
+              onBlur={() => setTimeout(() => setShowDropdown(false), 150)}
+              placeholder="Name or phone (e.g. 904-555-0102)"
+              style={{
+                width: "100%", padding: "10px 12px", borderRadius: 10,
+                border: `1.5px solid ${picked ? palette.green : palette.border}`,
+                background: picked ? palette.greenLight + "40" : "#fff",
+                fontSize: 14, fontFamily: "'Open Sans', sans-serif",
+                color: palette.dark, outline: "none", boxSizing: "border-box",
+              }}
+            />
+            {picked && (
+              <button
+                onClick={() => { setPicked(null); setQuery(""); }}
+                style={{
+                  position: "absolute", right: 8, top: 32,
+                  background: "transparent", border: "none",
+                  color: palette.muted, fontSize: 16, cursor: "pointer",
+                  padding: "4px 8px",
+                }}
+              >×</button>
+            )}
+            {!picked && showDropdown && results.length > 0 && (
+              <div style={{
+                position: "absolute", top: "100%", left: 0, right: 0,
+                background: palette.card, border: `1px solid ${palette.border}`,
+                borderRadius: 10, marginTop: 4, zIndex: 10,
+                maxHeight: 240, overflowY: "auto",
+                boxShadow: palette.shadowHover,
+              }}>
+                {results.slice(0, 20).map((m) => (
+                  <div
+                    key={m.phone}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      setPicked({ phone: m.phone, name: m.name });
+                      setQuery("");
+                      setShowDropdown(false);
+                    }}
+                    style={{
+                      padding: "10px 14px", cursor: "pointer",
+                      borderBottom: `1px solid ${palette.border}`,
+                      fontFamily: "'Open Sans', sans-serif",
+                    }}
+                    onMouseEnter={(e) => e.currentTarget.style.background = "#F5F8FB"}
+                    onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600, color: palette.dark }}>
+                      {m.name || "(no name)"}
+                    </div>
+                    <div style={{ fontSize: 11, color: palette.muted }}>
+                      {m.phone}{m.email ? ` · ${m.email}` : ""}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!picked && looksLikePhone && (
+              <div style={{
+                fontSize: 11, color: palette.muted, marginTop: 6,
+                fontFamily: "'Open Sans', sans-serif",
+              }}>
+                Will send to <strong style={{ color: palette.dark }}>{normalizedPhone}</strong> (not a known member — you'll be asked to confirm).
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginBottom: 16 }}>
+            <label style={{
+              display: "block", fontSize: 11, fontWeight: 600,
+              color: palette.muted, letterSpacing: 0.5,
+              textTransform: "uppercase", marginBottom: 6,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>Message</label>
+            <textarea
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              rows={5}
+              placeholder="Type your message…"
+              style={{
+                width: "100%", padding: "10px 12px", borderRadius: 10,
+                border: `1.5px solid ${palette.border}`, background: "#fff",
+                fontSize: 14, fontFamily: "'Open Sans', sans-serif",
+                color: palette.dark, outline: "none", resize: "vertical",
+                lineHeight: 1.4, boxSizing: "border-box", minHeight: 110,
+              }}
+            />
+            <div style={{
+              fontSize: 11, color: palette.muted, marginTop: 6,
+              fontFamily: "'Open Sans', sans-serif",
+            }}>
+              {body.length} char{body.length === 1 ? "" : "s"}
+              {body.length > 0 && ` · ${Math.ceil(body.length / 160)} segment${Math.ceil(body.length / 160) === 1 ? "" : "s"}`}
+            </div>
+          </div>
+
+          {error && (
+            <div style={{
+              padding: "10px 14px", borderRadius: 10,
+              background: palette.redLight, color: palette.red,
+              fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+              marginBottom: 12,
+            }}>⚠ {error}</div>
+          )}
+        </div>
+
+        <div style={{
+          padding: "14px 22px", borderTop: `1px solid ${palette.border}`,
+          display: "flex", justifyContent: "flex-end", gap: 10,
+          background: "#FAFBFC",
+        }}>
+          <button
+            onClick={onClose}
+            style={{
+              padding: "9px 18px", borderRadius: 10,
+              border: `1.5px solid ${palette.border}`, background: "transparent",
+              color: palette.muted, fontSize: 13, fontWeight: 600,
+              cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+            }}
+          >Cancel</button>
+          <button
+            onClick={initiateSend}
+            disabled={!canSend}
+            style={{
+              padding: "9px 22px", borderRadius: 10, border: "none",
+              background: canSend ? palette.accent : palette.border,
+              color: canSend ? "#fff" : palette.muted,
+              fontSize: 13, fontWeight: 600,
+              cursor: canSend ? "pointer" : "default",
+              fontFamily: "'Open Sans', sans-serif",
+            }}
+          >
+            {sending ? "Sending…" : "Send"}
+          </button>
+        </div>
+      </div>
+
+      {/* Confirm dialog for free-typed numbers */}
+      {pendingConfirm && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(11,37,69,0.55)",
+          zIndex: 1100, display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <div style={{
+            background: palette.card, borderRadius: 14, padding: "22px 26px",
+            width: "min(420px, 92vw)", boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
+          }}>
+            <div style={{
+              fontSize: 16, fontWeight: 700, color: palette.dark,
+              fontFamily: "'Montserrat', sans-serif", marginBottom: 8,
+            }}>Send to a new number?</div>
+            <div style={{
+              fontSize: 13, color: palette.muted, marginBottom: 16,
+              fontFamily: "'Open Sans', sans-serif", lineHeight: 1.5,
+            }}>
+              <strong style={{ color: palette.dark }}>{normalizedPhone}</strong> isn't in your members list. Double-check the digits — once sent, this counts as an outbound SMS and can't be undone.
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button
+                onClick={() => setPendingConfirm(false)}
+                style={{
+                  padding: "8px 16px", borderRadius: 10,
+                  border: `1.5px solid ${palette.border}`, background: "transparent",
+                  color: palette.muted, fontSize: 13, fontWeight: 600,
+                  cursor: "pointer", fontFamily: "'Open Sans', sans-serif",
+                }}
+              >Cancel</button>
+              <button
+                onClick={() => doSend(normalizedPhone)}
+                style={{
+                  padding: "8px 18px", borderRadius: 10, border: "none",
+                  background: palette.accent, color: "#fff",
+                  fontSize: 13, fontWeight: 600, cursor: "pointer",
+                  fontFamily: "'Open Sans', sans-serif",
+                }}
+              >Send</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 function ConversationsPanel({ onOpen }) {
   const [conversations, setConversations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState("unread"); // unread | newest | oldest | name
+  const [composing, setComposing] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -2454,6 +2780,19 @@ function ConversationsPanel({ onOpen }) {
           <option value="oldest">Oldest first</option>
           <option value="name">Name A–Z</option>
         </select>
+        <button
+          onClick={() => setComposing(true)}
+          style={{
+            padding: "10px 16px", borderRadius: 10, border: "none",
+            background: palette.accent, color: "#fff",
+            fontSize: 13, fontWeight: 600, cursor: "pointer",
+            fontFamily: "'Open Sans', sans-serif",
+            boxShadow: `0 2px 8px ${palette.accent}40`,
+            display: "flex", alignItems: "center", gap: 6,
+          }}
+        >
+          <span style={{ fontSize: 16, lineHeight: 1 }}>+</span> New Message
+        </button>
         <div style={{ color: palette.muted, fontSize: 12, fontFamily: "'Open Sans', sans-serif" }}>
           {filtered.length} conversation{filtered.length === 1 ? "" : "s"}
         </div>
@@ -2565,6 +2904,16 @@ function ConversationsPanel({ onOpen }) {
           })}
         </div>
       )}
+
+      {composing && (
+        <NewMessageModal
+          onClose={() => setComposing(false)}
+          onSent={(phone) => {
+            setComposing(false);
+            onOpen && onOpen(phone);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -2573,25 +2922,48 @@ function ConversationsPanel({ onOpen }) {
 function ConversationDrawer({ phone, onClose }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
+  const [replyText, setReplyText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState("");
   const scrollRef = useRef(null);
 
-  useEffect(() => {
-    let active = true;
-    const load = async () => {
-      try {
-        const result = await api.getConversation(phone);
-        if (active) setData(result);
-        // Re-mark as read on every refresh so a new inbound message arriving
-        // while the drawer is open doesn't transiently re-flag it as unread.
-        try { localStorage.setItem(`conv_read_${phone}`, new Date().toISOString()); } catch {}
-      } catch {
-        if (active) setError("Failed to load conversation");
-      }
-    };
-    load();
-    const interval = setInterval(load, 8000);
-    return () => { active = false; clearInterval(interval); };
+  const load = useCallback(async () => {
+    try {
+      const result = await api.getConversation(phone);
+      setData(result);
+      try { localStorage.setItem(`conv_read_${phone}`, new Date().toISOString()); } catch {}
+    } catch {
+      setError("Failed to load conversation");
+    }
   }, [phone]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => { if (!cancelled) await load(); };
+    tick();
+    const interval = setInterval(tick, 8000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [load]);
+
+  const sendReply = async () => {
+    const body = replyText.trim();
+    if (!body || sending) return;
+    setSending(true);
+    setSendError("");
+    try {
+      const r = await api.sendToPhone(phone, body);
+      if (r.success) {
+        setReplyText("");
+        await load();
+      } else {
+        setSendError(r.error || "Failed to send");
+      }
+    } catch {
+      setSendError("Network error");
+    } finally {
+      setSending(false);
+    }
+  };
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -2733,6 +3105,67 @@ function ConversationDrawer({ phone, onClose }) {
           })}
         </div>
       )}
+
+      {/* Reply composer */}
+      <div style={{
+        padding: "12px 14px", background: palette.card,
+        borderTop: `1px solid ${palette.border}`, flexShrink: 0,
+      }}>
+        {sendError && (
+          <div style={{
+            fontSize: 12, color: palette.red, marginBottom: 6,
+            fontFamily: "'Open Sans', sans-serif",
+          }}>⚠ {sendError}</div>
+        )}
+        <div style={{
+          display: "flex", gap: 8, alignItems: "flex-end",
+        }}>
+          <textarea
+            value={replyText}
+            onChange={(e) => setReplyText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                sendReply();
+              }
+            }}
+            placeholder={`Text ${name}…`}
+            rows={2}
+            style={{
+              flex: 1, padding: "10px 12px", borderRadius: 10,
+              border: `1.5px solid ${palette.border}`, background: "#fff",
+              fontSize: 13, fontFamily: "'Open Sans', sans-serif",
+              color: palette.dark, resize: "none", outline: "none",
+              lineHeight: 1.4, minHeight: 44, maxHeight: 140,
+            }}
+            onFocus={(e) => e.target.style.borderColor = palette.accent}
+            onBlur={(e) => e.target.style.borderColor = palette.border}
+          />
+          <button
+            onClick={sendReply}
+            disabled={!replyText.trim() || sending}
+            style={{
+              padding: "10px 18px", borderRadius: 10, border: "none",
+              background: replyText.trim() && !sending ? palette.accent : palette.border,
+              color: replyText.trim() && !sending ? "#fff" : palette.muted,
+              fontSize: 13, fontWeight: 600,
+              cursor: replyText.trim() && !sending ? "pointer" : "default",
+              fontFamily: "'Open Sans', sans-serif",
+              transition: "all 0.15s", flexShrink: 0,
+            }}
+          >
+            {sending ? "Sending…" : "Send"}
+          </button>
+        </div>
+        <div style={{
+          fontSize: 10, color: palette.muted, marginTop: 6,
+          fontFamily: "'Open Sans', sans-serif",
+        }}>
+          {replyText.length} char{replyText.length === 1 ? "" : "s"}
+          {replyText.length > 0 && ` · ${Math.ceil(replyText.length / 160)} segment${Math.ceil(replyText.length / 160) === 1 ? "" : "s"}`}
+          {" · ⌘/Ctrl+Enter to send"}
+        </div>
+      </div>
     </div>
   );
 }

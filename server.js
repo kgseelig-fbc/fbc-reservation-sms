@@ -1005,7 +1005,8 @@ app.post("/api/reservations/:id/approve-time-change", requireAuth, requireFranch
     const newTimeStr = new Date(reservation.pending_time_change).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
     try {
       await sendAndLogSms(req.franchise, updated[0],
-        `Great news! Your new arrival time of ${newTimeStr} is confirmed. See you then!`);
+        `Great news! Your new arrival time of ${newTimeStr} is confirmed. See you then!`,
+        req.session.userId);
     } catch (err) {
       console.error("Approve time-change SMS error:", err.message);
     }
@@ -1036,7 +1037,8 @@ app.post("/api/reservations/:id/reject-time-change", requireAuth, requireFranchi
     );
     try {
       await sendAndLogSms(req.franchise, updated[0],
-        `Sorry — ${requestedTimeStr} isn't available. Your reservation remains at ${originalTimeStr}. Reply YES to confirm or CANCEL if you can't make it.`);
+        `Sorry — ${requestedTimeStr} isn't available. Your reservation remains at ${originalTimeStr}. Reply YES to confirm or CANCEL if you can't make it.`,
+        req.session.userId);
     } catch (err) {
       console.error("Reject time-change SMS error:", err.message);
     }
@@ -1067,7 +1069,7 @@ function buildSmsBody(reservation) {
   );
 }
 
-async function sendAndLogSms(franchise, reservationRow, customBody) {
+async function sendAndLogSms(franchise, reservationRow, customBody, sentByUserId) {
   const client = getTwilioClient(franchise);
   if (!client) throw new Error(`Twilio is not configured for ${franchise.name}`);
   if (!reservationRow.phone) throw new Error("No phone number on file");
@@ -1090,9 +1092,9 @@ async function sendAndLogSms(franchise, reservationRow, customBody) {
 
   await db.withTx(async (c) => {
     await c.query(
-      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status)
-       VALUES ($1,$2,$3,$4,'out',$5,$6,$7)`,
-      [franchise.id, toPhone, reservationRow.id, reservationRow.dock_id, body, message.sid, message.status]
+      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status, sent_by_user_id)
+       VALUES ($1,$2,$3,$4,'out',$5,$6,$7,$8)`,
+      [franchise.id, toPhone, reservationRow.id, reservationRow.dock_id, body, message.sid, message.status, sentByUserId || null]
     );
     await c.query(
       `UPDATE reservations
@@ -1117,7 +1119,7 @@ app.post("/api/sms/send/:id", requireAuth, requireFranchiseContext, async (req, 
       [id, req.franchiseId]
     );
     if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
-    const message = await sendAndLogSms(req.franchise, rows[0], customBody);
+    const message = await sendAndLogSms(req.franchise, rows[0], customBody, req.session.userId);
     const { rows: updated } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
     res.json({ success: true, messageSid: message.sid, reservation: rowToReservation(updated[0]) });
   } catch (err) {
@@ -1166,7 +1168,7 @@ app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req,
   const results = { sent: 0, failed: 0, errors: [] };
   for (const r of targets) {
     try {
-      await sendAndLogSms(req.franchise, r);
+      await sendAndLogSms(req.franchise, r, undefined, req.session.userId);
       results.sent++;
     } catch (err) {
       console.error(`SMS failed for ${r.id}:`, err.message);
@@ -1209,14 +1211,101 @@ app.post("/api/sms/simulate", requireAuth, requireFranchiseContext, async (req, 
     });
 
     await db.query(
-      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status)
-       VALUES ($1,$2,$3,$4,'out',$5,$6,$7)`,
-      [req.franchiseId, toPhone, reservation.id, reservation.dock_id, reply, message.sid, message.status]
+      `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status, sent_by_user_id)
+       VALUES ($1,$2,$3,$4,'out',$5,$6,$7,$8)`,
+      [req.franchiseId, toPhone, reservation.id, reservation.dock_id, reply, message.sid, message.status, req.session.userId]
     );
     res.json({ success: true, messageSid: message.sid });
   } catch (err) {
     console.error("Twilio send error (chat):", err.message);
     res.status(500).json({ error: `Failed to send: ${err.message}` });
+  }
+});
+
+// --- Free-text SMS to a phone in the active franchise ---
+// Powers the inline reply box on ConversationDrawer and the "+ New Message"
+// composer. Looks up the most recent reservation for that phone (if any)
+// to attach a reservation_id / dock_id for context, but works even when
+// none exists — i.e., texting a member who has never booked.
+app.post("/api/sms/send-to-phone", requireAuth, requireFranchiseContext, async (req, res) => {
+  const rawPhone = req.body?.phone;
+  const body = String(req.body?.body || "").trim();
+  if (!rawPhone) return res.status(400).json({ error: "Missing phone" });
+  if (!body) return res.status(400).json({ error: "Message body is empty" });
+  if (body.length > 1600) return res.status(400).json({ error: "Message too long (max 1600 chars)" });
+
+  const toPhone = normalizePhone(rawPhone);
+  if (!toPhone || toPhone.replace(/\D/g, "").length < 10) {
+    return res.status(400).json({ error: "Invalid phone number" });
+  }
+
+  const client = getTwilioClient(req.franchise);
+  if (!client) return res.status(400).json({ error: `Twilio is not configured for ${req.franchise.name}` });
+
+  try {
+    const { rows: resvRows } = await db.query(
+      `SELECT id, dock_id, name, email FROM reservations
+        WHERE franchise_id = $1 AND phone = $2
+        ORDER BY reservation_date DESC NULLS LAST, created_at DESC
+        LIMIT 1`,
+      [req.franchiseId, toPhone]
+    );
+    const ctx = resvRows[0] || null;
+
+    const message = await client.messages.create({
+      body,
+      ...(req.franchise.twilio_messaging_service_sid
+        ? { messagingServiceSid: req.franchise.twilio_messaging_service_sid }
+        : { from: req.franchise.twilio_phone_number }),
+      to: toPhone,
+      statusCallback: req.franchise.base_url
+        ? `${req.franchise.base_url.replace(/\/+$/, "")}/api/sms/status`
+        : undefined,
+    });
+
+    await db.withTx(async (c) => {
+      await c.query(
+        `INSERT INTO messages (franchise_id, phone, reservation_id, dock_id, direction, body, twilio_sid, twilio_status, sent_by_user_id)
+         VALUES ($1,$2,$3,$4,'out',$5,$6,$7,$8)`,
+        [
+          req.franchiseId, toPhone,
+          ctx ? ctx.id : null, ctx ? ctx.dock_id : null,
+          body, message.sid, message.status, req.session.userId,
+        ]
+      );
+      await upsertMember(c, req.franchiseId, toPhone, ctx ? ctx.name : null, ctx ? ctx.email : null);
+    });
+
+    res.json({ success: true, messageSid: message.sid, phone: toPhone });
+  } catch (err) {
+    console.error("send-to-phone error:", err.message);
+    res.status(500).json({ error: `Failed to send: ${err.message}` });
+  }
+});
+
+// --- Members directory (for the new-message composer's autocomplete) ---
+// Returns members of the active franchise, name+phone+email only. Search
+// is a case-insensitive substring match on name or phone digits.
+app.get("/api/members", requireAuth, requireFranchiseContext, async (req, res) => {
+  const q = String(req.query.q || "").trim().toLowerCase();
+  const qDigits = q.replace(/\D/g, "");
+  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  try {
+    const { rows } = await db.query(
+      `SELECT phone, name, email, first_seen, last_seen
+         FROM members
+        WHERE franchise_id = $1
+          AND ($2 = ''
+               OR LOWER(COALESCE(name, '')) LIKE '%' || $2 || '%'
+               OR ($3 <> '' AND REGEXP_REPLACE(phone, '\\D', '', 'g') LIKE '%' || $3 || '%'))
+        ORDER BY last_seen DESC NULLS LAST, name ASC
+        LIMIT $4`,
+      [req.franchiseId, q, qDigits, limit]
+    );
+    res.json({ members: rows });
+  } catch (err) {
+    console.error("List members error:", err);
+    res.status(500).json({ error: "Database error" });
   }
 });
 
