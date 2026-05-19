@@ -28,13 +28,24 @@ if (pushEnabled) {
   console.warn("Web Push disabled — VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not set.");
 }
 
-// Fan out a payload to every push subscription for a franchise. Dead/expired
-// subscriptions (404/410) are pruned so the next inbound doesn't retry them.
-async function pushToFranchise(franchiseId, payload) {
+// Fan out a payload to every relevant subscriber for an inbound SMS:
+//   - admins (super_admin / franchise_admin) for the franchise — always
+//   - franchise_staff users only if their dock_id matches `dockId`
+//   - franchise_staff users with NULL dock_id (legacy, un-scoped) — always
+// Passing dockId=null is the "orphan inbound" case (no reservation matched);
+// only admins receive that. Dead/expired subscriptions (404/410) are pruned.
+async function pushForInbound(franchiseId, dockId, payload) {
   if (!pushEnabled || !franchiseId) return;
   const { rows } = await db.query(
-    `SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE franchise_id = $1`,
-    [franchiseId]
+    `SELECT ps.id, ps.endpoint, ps.p256dh, ps.auth
+       FROM push_subscriptions ps
+       JOIN users u ON u.id = ps.user_id
+      WHERE ps.franchise_id = $1
+        AND (
+          u.role IN ('super_admin', 'franchise_admin')
+          OR (u.role = 'franchise_staff' AND ($2::text IS NOT NULL) AND (u.dock_id = $2 OR u.dock_id IS NULL))
+        )`,
+    [franchiseId, dockId || null]
   );
   if (rows.length === 0) return;
   const body = JSON.stringify(payload);
@@ -193,6 +204,42 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
+// Returns the dock_id the current user is locked to, or null if unrestricted.
+// Only franchise_staff with an assigned dock are scoped; admins (super_admin /
+// franchise_admin) and legacy staff without a dock see the whole franchise.
+function userDockScope(req) {
+  if (req.session.role === "franchise_staff" && req.session.dockId) return req.session.dockId;
+  return null;
+}
+
+// 403s the request if a dock-scoped user is reaching for a dock that isn't
+// theirs. Returns true if allowed, false if blocked (and the response is sent).
+function denyIfDockOutOfScope(req, res, dockId) {
+  const scope = userDockScope(req);
+  if (scope && dockId !== scope) {
+    res.status(403).json({ error: "Forbidden: this dock is not in your assigned scope" });
+    return true;
+  }
+  return false;
+}
+
+// Same idea but for reservation-id endpoints: looks up the reservation and
+// 403s/404s if it isn't in the user's dock scope. Returns the reservation row
+// when allowed, or null when blocked (response already sent).
+async function loadReservationInScope(req, res, reservationId) {
+  const { rows } = await db.query(
+    `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
+    [reservationId, req.franchiseId]
+  );
+  if (rows.length === 0) { res.status(404).json({ error: "Reservation not found" }); return null; }
+  const scope = userDockScope(req);
+  if (scope && rows[0].dock_id !== scope) {
+    res.status(403).json({ error: "Forbidden: reservation is at a different dock" });
+    return null;
+  }
+  return rows[0];
+}
+
 // Returns the public origin of this request so OAuth redirects point at the UI the
 // user came from. Falls back to host header.
 function originFromRequest(req) {
@@ -291,6 +338,7 @@ app.get("/api/auth/google/callback", loginLimiter, async (req, res) => {
     req.session.status = user.status;
     req.session.franchiseId = user.franchise_id;
     req.session.activeFranchiseId = user.franchise_id;
+    req.session.dockId = user.dock_id || null;
 
     res.redirect("/");
   } catch (err) {
@@ -326,18 +374,39 @@ app.get("/api/me", requireAuth, async (req, res) => {
     const activeId = req.session.activeFranchiseId;
     let franchise = null;
     let docks = [];
+    // Re-read dock_id from the user row in case it was assigned/changed after
+    // login; this keeps `req.session.dockId` fresh without forcing a logout.
+    const { rows: userRows } = await db.query(
+      `SELECT dock_id FROM users WHERE id = $1`, [req.session.userId]
+    );
+    const userDockId = userRows[0] ? userRows[0].dock_id : null;
+    req.session.dockId = userDockId;
+
     if (activeId) {
       franchise = await loadFranchise(activeId);
       if (franchise) {
-        const { rows } = await db.query(
-          `SELECT id, name, sort_order FROM docks WHERE franchise_id = $1 ORDER BY sort_order ASC, name ASC`,
-          [franchise.id]
-        );
+        // Dock-scoped users only see their assigned dock in the picker;
+        // admins (super_admin / franchise_admin) see all docks.
+        const isDockScoped = req.session.role === "franchise_staff" && userDockId;
+        const { rows } = isDockScoped
+          ? await db.query(
+              `SELECT id, name, sort_order FROM docks WHERE franchise_id = $1 AND id = $2`,
+              [franchise.id, userDockId]
+            )
+          : await db.query(
+              `SELECT id, name, sort_order FROM docks WHERE franchise_id = $1 ORDER BY sort_order ASC, name ASC`,
+              [franchise.id]
+            );
         docks = rows;
       }
     }
     res.json({
-      user: { email: req.session.email, role: req.session.role, franchiseId: req.session.franchiseId },
+      user: {
+        email: req.session.email,
+        role: req.session.role,
+        franchiseId: req.session.franchiseId,
+        dockId: userDockId,
+      },
       franchise: franchise && {
         id: franchise.id, slug: franchise.slug, name: franchise.name,
         timezone: franchise.timezone, logoUrl: franchise.logo_url,
@@ -361,7 +430,16 @@ app.get("/api/admin/franchises", requireAuth, requireSuperAdmin, async (req, res
             created_at
      FROM franchises ORDER BY name ASC`
   );
-  res.json({ franchises: rows });
+  const { rows: docks } = await db.query(
+    `SELECT id, franchise_id, name FROM docks ORDER BY franchise_id, sort_order ASC, name ASC`
+  );
+  const docksByFranchise = {};
+  for (const d of docks) {
+    (docksByFranchise[d.franchise_id] = docksByFranchise[d.franchise_id] || []).push({ id: d.id, name: d.name });
+  }
+  res.json({
+    franchises: rows.map((f) => ({ ...f, docks: docksByFranchise[f.id] || [] })),
+  });
 });
 
 app.post("/api/admin/switch-franchise", requireAuth, requireSuperAdmin, async (req, res) => {
@@ -382,9 +460,11 @@ app.get("/api/admin/users", requireAuth, requireSuperAdmin, async (req, res) => 
     const { rows } = await db.query(
       `SELECT u.id, u.email, u.name, u.avatar_url, u.role, u.status,
               u.franchise_id, f.name AS franchise_name,
+              u.dock_id, d.name AS dock_name,
               u.created_at, u.last_login, u.approved_at
          FROM users u
          LEFT JOIN franchises f ON f.id = u.franchise_id
+         LEFT JOIN docks d ON d.id = u.dock_id
         WHERE ($1::text IS NULL OR u.status = $1)
         ORDER BY
           CASE u.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1
@@ -400,33 +480,75 @@ app.get("/api/admin/users", requireAuth, requireSuperAdmin, async (req, res) => 
 });
 
 // Approve a pending user. super_admin requires franchise_id = NULL;
-// franchise_admin/franchise_staff requires a valid franchise_id.
+// franchise_admin/franchise_staff requires a valid franchise_id. A dockId may
+// be supplied to scope a franchise_staff user to a single dock; ignored for
+// other roles.
 app.post("/api/admin/users/:id/approve", requireAuth, requireSuperAdmin, async (req, res) => {
   const targetId = parseInt(req.params.id, 10);
-  const { role, franchiseId } = req.body || {};
+  const { role, franchiseId, dockId } = req.body || {};
   if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: "Invalid role" });
   const wantsFranchise = role !== "super_admin";
   const fid = wantsFranchise ? parseInt(franchiseId, 10) : null;
   if (wantsFranchise && !fid) return res.status(400).json({ error: "franchiseId required for this role" });
+  // dockId only meaningful for franchise_staff; silently drop it otherwise.
+  const did = role === "franchise_staff" && dockId ? String(dockId) : null;
 
   try {
     if (fid) {
       const f = await loadFranchise(fid);
       if (!f) return res.status(404).json({ error: "Franchise not found" });
     }
+    if (did) {
+      const { rows: dockRows } = await db.query(
+        `SELECT id FROM docks WHERE id = $1 AND franchise_id = $2`, [did, fid]
+      );
+      if (dockRows.length === 0) return res.status(400).json({ error: "Dock does not belong to that franchise" });
+    }
     const { rows } = await db.query(
       `UPDATE users
-          SET role = $1, franchise_id = $2, status = 'approved',
-              approved_at = NOW(), approved_by = $3
-        WHERE id = $4
-        RETURNING id, email, role, franchise_id, status`,
-      [role, fid, req.session.userId, targetId]
+          SET role = $1, franchise_id = $2, dock_id = $3, status = 'approved',
+              approved_at = NOW(), approved_by = $4
+        WHERE id = $5
+        RETURNING id, email, role, franchise_id, dock_id, status`,
+      [role, fid, did, req.session.userId, targetId]
     );
     if (rows.length === 0) return res.status(404).json({ error: "User not found" });
     res.json({ success: true, user: rows[0] });
   } catch (err) {
     console.error("Approve user error:", err);
     res.status(500).json({ error: err.message || "Failed to approve user" });
+  }
+});
+
+// Change/clear the dock assignment for an existing user. Only meaningful for
+// franchise_staff; passing dockId=null clears the scoping (full franchise access).
+app.post("/api/admin/users/:id/dock", requireAuth, requireSuperAdmin, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  const { dockId } = req.body || {};
+  try {
+    const { rows: userRows } = await db.query(
+      `SELECT role, franchise_id FROM users WHERE id = $1`, [targetId]
+    );
+    if (userRows.length === 0) return res.status(404).json({ error: "User not found" });
+    const u = userRows[0];
+    if (u.role !== "franchise_staff") {
+      return res.status(400).json({ error: "Dock scoping only applies to franchise_staff users" });
+    }
+    const did = dockId ? String(dockId) : null;
+    if (did) {
+      const { rows: dockRows } = await db.query(
+        `SELECT id FROM docks WHERE id = $1 AND franchise_id = $2`, [did, u.franchise_id]
+      );
+      if (dockRows.length === 0) return res.status(400).json({ error: "Dock does not belong to that user's franchise" });
+    }
+    const { rows } = await db.query(
+      `UPDATE users SET dock_id = $1 WHERE id = $2 RETURNING id, email, role, franchise_id, dock_id`,
+      [did, targetId]
+    );
+    res.json({ success: true, user: rows[0] });
+  } catch (err) {
+    console.error("Assign dock error:", err);
+    res.status(500).json({ error: "Database error" });
   }
 });
 
@@ -760,6 +882,7 @@ function rowToReservation(r) {
 app.get("/api/reservations", requireAuth, requireFranchiseContext, async (req, res) => {
   const dockId = req.query.dock;
   if (!dockId) return res.status(400).json({ error: "Missing dock parameter" });
+  if (denyIfDockOutOfScope(req, res, dockId)) return;
 
   try {
     // Confirm dock belongs to active franchise
@@ -832,6 +955,7 @@ app.get("/api/reservations", requireAuth, requireFranchiseContext, async (req, r
 app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async (req, res) => {
   const dockId = req.query.dock || req.body.dock;
   if (!dockId) return res.status(400).json({ error: "Missing dock parameter" });
+  if (denyIfDockOutOfScope(req, res, dockId)) return;
 
   try {
     const { rows: dockRows } = await db.query(
@@ -897,7 +1021,13 @@ app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async
 // Each batch shows when it was imported, by whom, the row count, and
 // aggregate SMS outcome counts so staff can audit what happened to a batch.
 app.get("/api/import-batches", requireAuth, requireFranchiseContext, async (req, res) => {
-  const dockId = req.query.dock || null;
+  // Dock-scoped users see only their own dock's batches, no matter what they
+  // ask for. Admins use the optional dock filter as-is.
+  const scope = userDockScope(req);
+  const dockId = scope || (req.query.dock || null);
+  if (req.query.dock && scope && req.query.dock !== scope) {
+    return res.status(403).json({ error: "Forbidden: this dock is not in your assigned scope" });
+  }
   try {
     const { rows } = await db.query(
       `SELECT
@@ -948,6 +1078,7 @@ app.get("/api/import-batches/:id", requireAuth, requireFranchiseContext, async (
     );
     if (batchRows.length === 0) return res.status(404).json({ error: "Batch not found" });
     const batch = batchRows[0];
+    if (denyIfDockOutOfScope(req, res, batch.dock_id)) return;
 
     const { rows: reservations } = await db.query(
       `SELECT * FROM reservations
@@ -1003,6 +1134,8 @@ app.post("/api/reservations/:id/status", requireAuth, requireFranchiseContext, a
   const { id } = req.params;
   const { status } = req.body;
   try {
+    const inScope = await loadReservationInScope(req, res, id);
+    if (!inScope) return;
     const { rows } = await db.query(
       `UPDATE reservations SET status = $1
        WHERE id = $2 AND franchise_id = $3
@@ -1029,6 +1162,7 @@ app.post("/api/reservations/:id/approve-time-change", requireAuth, requireFranch
     );
     if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
     const reservation = rows[0];
+    if (denyIfDockOutOfScope(req, res, reservation.dock_id)) return;
     if (!reservation.pending_time_change) {
       return res.status(400).json({ error: "No pending time change on this reservation" });
     }
@@ -1068,6 +1202,7 @@ app.post("/api/reservations/:id/reject-time-change", requireAuth, requireFranchi
     );
     if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
     const reservation = rows[0];
+    if (denyIfDockOutOfScope(req, res, reservation.dock_id)) return;
     if (!reservation.pending_time_change) {
       return res.status(400).json({ error: "No pending time change on this reservation" });
     }
@@ -1156,12 +1291,9 @@ app.post("/api/sms/send/:id", requireAuth, requireFranchiseContext, async (req, 
   const { id } = req.params;
   const { customBody } = req.body || {};
   try {
-    const { rows } = await db.query(
-      `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
-      [id, req.franchiseId]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
-    const message = await sendAndLogSms(req.franchise, rows[0], customBody, req.session.userId);
+    const reservation = await loadReservationInScope(req, res, id);
+    if (!reservation) return;
+    const message = await sendAndLogSms(req.franchise, reservation, customBody, req.session.userId);
     const { rows: updated } = await db.query(`SELECT * FROM reservations WHERE id = $1`, [id]);
     res.json({ success: true, messageSid: message.sid, reservation: rowToReservation(updated[0]) });
   } catch (err) {
@@ -1173,6 +1305,7 @@ app.post("/api/sms/send/:id", requireAuth, requireFranchiseContext, async (req, 
 app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req, res) => {
   const { ids, dock: dockId } = req.body;
   if (!dockId) return res.status(400).json({ error: "Missing dock parameter" });
+  if (denyIfDockOutOfScope(req, res, dockId)) return;
 
   // Fetch the full candidate set without the eligibility filter so we can
   // report back exactly how many were skipped and why (no phone vs. already
@@ -1233,6 +1366,7 @@ app.post("/api/sms/simulate", requireAuth, requireFranchiseContext, async (req, 
     );
     if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
     const reservation = rows[0];
+    if (denyIfDockOutOfScope(req, res, reservation.dock_id)) return;
     if (!reservation.phone) return res.status(400).json({ error: "No phone number on file for this reservation" });
 
     const client = getTwilioClient(req.franchise);
@@ -1293,6 +1427,13 @@ app.post("/api/sms/send-to-phone", requireAuth, requireFranchiseContext, async (
       [req.franchiseId, toPhone]
     );
     const ctx = resvRows[0] || null;
+
+    // Dock-scoped users may only message phones tied to a reservation at their
+    // dock. No matching reservation (or wrong dock) is a 403.
+    const scope = userDockScope(req);
+    if (scope && (!ctx || ctx.dock_id !== scope)) {
+      return res.status(403).json({ error: "Forbidden: recipient is not at your dock" });
+    }
 
     const message = await client.messages.create({
       body,
@@ -1363,6 +1504,7 @@ app.post("/api/sms/send-to-phones", requireAuth, requireFranchiseContext, async 
     ? { messagingServiceSid: req.franchise.twilio_messaging_service_sid }
     : { from: req.franchise.twilio_phone_number };
 
+  const scope = userDockScope(req);
   const results = { sent: 0, failed: 0, errors: [] };
   for (const toPhone of normalized) {
     try {
@@ -1374,6 +1516,12 @@ app.post("/api/sms/send-to-phones", requireAuth, requireFranchiseContext, async 
         [req.franchiseId, toPhone]
       );
       const ctx = resvRows[0] || null;
+
+      if (scope && (!ctx || ctx.dock_id !== scope)) {
+        results.failed++;
+        results.errors.push({ phone: toPhone, error: "Recipient not at your dock" });
+        continue;
+      }
 
       const message = await client.messages.create({
         body, to: toPhone, statusCallback, ...fromArgs,
@@ -1416,17 +1564,24 @@ app.get("/api/members", requireAuth, requireFranchiseContext, async (req, res) =
   const q = String(req.query.q || "").trim().toLowerCase();
   const qDigits = q.replace(/\D/g, "");
   const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  const scope = userDockScope(req);
   try {
+    // Dock-scoped users only see members who have at least one reservation at
+    // their dock (in this franchise). Admins see all members in the franchise.
     const { rows } = await db.query(
-      `SELECT phone, name, email, first_seen, last_seen
-         FROM members
-        WHERE franchise_id = $1
+      `SELECT m.phone, m.name, m.email, m.first_seen, m.last_seen
+         FROM members m
+        WHERE m.franchise_id = $1
           AND ($2 = ''
-               OR LOWER(COALESCE(name, '')) LIKE '%' || $2 || '%'
-               OR ($3 <> '' AND REGEXP_REPLACE(phone, '\\D', '', 'g') LIKE '%' || $3 || '%'))
-        ORDER BY last_seen DESC NULLS LAST, name ASC
+               OR LOWER(COALESCE(m.name, '')) LIKE '%' || $2 || '%'
+               OR ($3 <> '' AND REGEXP_REPLACE(m.phone, '\\D', '', 'g') LIKE '%' || $3 || '%'))
+          AND ($5::text IS NULL OR EXISTS (
+            SELECT 1 FROM reservations r
+             WHERE r.phone = m.phone AND r.franchise_id = m.franchise_id AND r.dock_id = $5
+          ))
+        ORDER BY m.last_seen DESC NULLS LAST, m.name ASC
         LIMIT $4`,
-      [req.franchiseId, q, qDigits, limit]
+      [req.franchiseId, q, qDigits, limit, scope]
     );
     res.json({ members: rows });
   } catch (err) {
@@ -1596,13 +1751,17 @@ app.post("/api/sms/incoming", express.urlencoded({ extended: false }), async (re
        reservation ? reservation.dock_id : null, responseText]
     );
 
-    // Fire-and-forget push to all staff devices for this franchise. We don't
-    // await it because the inbound webhook needs to respond to Twilio promptly.
+    // Fire-and-forget push to relevant staff devices. Admins always get it;
+    // franchise_staff only get it if the reservation's dock matches theirs.
+    // No reservation = orphan inbound = admins only. Don't await — Twilio
+    // needs a prompt response.
     const senderName = reservation && reservation.name ? reservation.name : normalizedFrom;
-    pushToFranchise(franchise.id, {
+    const dockForPush = reservation ? reservation.dock_id : null;
+    pushForInbound(franchise.id, dockForPush, {
       title: `New SMS from ${senderName}`,
       body: inboundText.slice(0, 160),
       phone: normalizedFrom,
+      dockId: dockForPush,
       url: `/dashboard?phone=${encodeURIComponent(normalizedFrom)}`,
     }).catch((e) => console.error("Push fan-out error:", e && e.message));
   } catch (err) {
@@ -1634,12 +1793,8 @@ app.post("/api/sms/status", express.urlencoded({ extended: false }), async (req,
 app.get("/api/sms/log/:id", requireAuth, requireFranchiseContext, async (req, res) => {
   const { id } = req.params;
   try {
-    const { rows } = await db.query(
-      `SELECT * FROM reservations WHERE id = $1 AND franchise_id = $2`,
-      [id, req.franchiseId]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
-    const reservation = rows[0];
+    const reservation = await loadReservationInScope(req, res, id);
+    if (!reservation) return;
 
     const { rows: messages } = await db.query(
       `SELECT * FROM messages WHERE franchise_id = $1 AND phone = $2 ORDER BY created_at ASC`,
@@ -1665,7 +1820,11 @@ app.get("/api/sms/log/:id", requireAuth, requireFranchiseContext, async (req, re
 });
 
 app.get("/api/conversations", requireAuth, requireFranchiseContext, async (req, res) => {
+  const scope = userDockScope(req);
   try {
+    // For dock-scoped users, only surface conversations whose most-recent
+    // reservation in this franchise sits at their dock. Phones with no
+    // reservation at all are hidden (admins still see them).
     const { rows } = await db.query(
       `SELECT
          m.phone,
@@ -1679,14 +1838,15 @@ app.get("/api/conversations", requireAuth, requireFranchiseContext, async (req, 
        FROM messages m
        LEFT JOIN members mem ON mem.phone = m.phone AND mem.franchise_id = m.franchise_id
        LEFT JOIN LATERAL (
-         SELECT name FROM reservations r
+         SELECT name, dock_id FROM reservations r
          WHERE r.phone = m.phone AND r.franchise_id = m.franchise_id
          ORDER BY r.created_at DESC LIMIT 1
        ) r_last ON TRUE
        WHERE m.franchise_id = $1
+         AND ($2::text IS NULL OR r_last.dock_id = $2)
        GROUP BY m.phone, mem.name, mem.email, r_last.name
        ORDER BY MAX(m.created_at) DESC`,
-      [req.franchiseId]
+      [req.franchiseId, scope]
     );
 
     const phones = rows.map((r) => r.phone).filter(Boolean);
@@ -1715,7 +1875,21 @@ app.get("/api/conversations", requireAuth, requireFranchiseContext, async (req, 
 
 app.get("/api/conversations/:phone", requireAuth, requireFranchiseContext, async (req, res) => {
   const phone = normalizePhone(req.params.phone);
+  const scope = userDockScope(req);
   try {
+    // Dock-scoped users only see this conversation if the most-recent matching
+    // reservation in this franchise is at their dock.
+    if (scope) {
+      const { rows: r } = await db.query(
+        `SELECT dock_id FROM reservations
+          WHERE franchise_id = $1 AND phone = $2
+          ORDER BY created_at DESC LIMIT 1`,
+        [req.franchiseId, phone]
+      );
+      if (r.length === 0 || r[0].dock_id !== scope) {
+        return res.status(404).json({ error: "Conversation not found" });
+      }
+    }
     const [{ rows: member }, { rows: messages }, { rows: reservations }, homeFranchises] = await Promise.all([
       db.query(`SELECT * FROM members WHERE franchise_id = $1 AND phone = $2`, [req.franchiseId, phone]),
       db.query(`SELECT * FROM messages WHERE franchise_id = $1 AND phone = $2 ORDER BY created_at ASC`, [req.franchiseId, phone]),

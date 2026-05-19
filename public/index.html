@@ -73,12 +73,22 @@ const api = {
     return res.json();
   },
 
-  async approveUser(id, role, franchiseId) {
+  async approveUser(id, role, franchiseId, dockId) {
     const res = await fetch(`${API_BASE}/api/admin/users/${id}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ role, franchiseId }),
+      body: JSON.stringify({ role, franchiseId, dockId }),
+    });
+    return res.json();
+  },
+
+  async assignUserDock(id, dockId) {
+    const res = await fetch(`${API_BASE}/api/admin/users/${id}/dock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ dockId }),
     });
     return res.json();
   },
@@ -3603,6 +3613,16 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
     return () => { active = false; clearInterval(interval); };
   }, []);
 
+  // Dock-scoped users skip the picker entirely — auto-select their assigned
+  // dock as soon as we know what it is. Admins still pick from the full list.
+  const userDockId = me && me.user ? me.user.dockId : null;
+  const isDockScoped = !!userDockId;
+  useEffect(() => {
+    if (isDockScoped && state.currentDock !== userDockId) {
+      dispatch({ type: "SET_DOCK", payload: userDockId });
+    }
+  }, [isDockScoped, userDockId, state.currentDock]);
+
   // Poll the backend API for reservation updates when in live mode
   useEffect(() => {
     if (!api.isLive() || !state.currentDock) return;
@@ -3941,7 +3961,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
             >
               <span style={{ fontSize: 15 }}>↑</span> Upload
             </button>
-            {state.currentDock && (
+            {state.currentDock && !isDockScoped && (
               <button
                 onClick={() => dispatch({ type: "SWITCH_DOCK" })}
                 style={{
@@ -3956,6 +3976,17 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
               >
                 <span style={{ fontSize: 13 }}>⚓</span> {DOCKS.find((d) => d.id === state.currentDock)?.name || "Switch Dock"}
               </button>
+            )}
+            {state.currentDock && isDockScoped && (
+              <div style={{
+                padding: "10px 14px", borderRadius: 10,
+                border: `1.5px solid ${palette.border}`,
+                color: palette.muted, fontSize: 12, fontWeight: 600,
+                fontFamily: "'Open Sans', sans-serif",
+                display: "flex", alignItems: "center", gap: 6,
+              }}>
+                <span style={{ fontSize: 13 }}>⚓</span> {DOCKS.find((d) => d.id === state.currentDock)?.name || ""}
+              </div>
             )}
             {me && me.user && me.user.role === "super_admin" && (
               <SuperAdminFranchiseSwitcher
@@ -4002,8 +4033,12 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           </div>
         </div>
 
-        {/* Dock Selection Screen */}
-        {state.view === "dock-select" ? (
+        {/* Brief flash protection: while a dock-scoped user is auto-selecting */}
+        {state.view === "dock-select" && isDockScoped ? (
+          <div style={{ padding: "60px 20px", textAlign: "center", color: palette.muted, fontFamily: "'Montserrat', sans-serif" }}>
+            Loading your dock...
+          </div>
+        ) : state.view === "dock-select" && !isDockScoped ? (
           <div style={{
             display: "flex", flexDirection: "column", alignItems: "center",
             justifyContent: "center", padding: "60px 20px",
@@ -4640,9 +4675,9 @@ function UsersPanel({ palette }) {
               franchises={franchises}
               palette={palette}
               busy={busyId === u.id}
-              onApprove={async (role, fid) => {
+              onApprove={async (role, fid, dockId) => {
                 setBusyId(u.id);
-                const r = await api.approveUser(u.id, role, fid);
+                const r = await api.approveUser(u.id, role, fid, dockId || null);
                 setBusyId(null);
                 if (r.success) reload(); else alert(r.error || "Failed to approve");
               }}
@@ -4677,7 +4712,18 @@ function UsersPanel({ palette }) {
 function UserRow({ user, franchises, palette, busy, onApprove, onReject, onDisable, onReinstate }) {
   const [role, setRole] = useState(user.role || "franchise_staff");
   const [fid, setFid] = useState(user.franchise_id ? String(user.franchise_id) : "");
+  const [did, setDid] = useState(user.dock_id || "");
   const needsFranchise = role !== "super_admin";
+  const needsDock = role === "franchise_staff";
+  // Reset dock if the franchise changes or the role no longer takes a dock.
+  useEffect(() => {
+    if (!needsDock) { if (did) setDid(""); return; }
+    const fObj = franchises.find((f) => String(f.id) === String(fid));
+    const docks = (fObj && fObj.docks) || [];
+    if (did && !docks.some((d) => d.id === did)) setDid("");
+  }, [fid, needsDock, franchises]);
+  const currentFranchise = franchises.find((f) => String(f.id) === String(fid));
+  const dockOptions = (currentFranchise && currentFranchise.docks) || [];
 
   const statusBadge = {
     pending:  { bg: "#fef3c7", fg: "#92400e", label: "Pending" },
@@ -4719,7 +4765,7 @@ function UserRow({ user, franchises, palette, busy, onApprove, onReject, onDisab
             }}>{statusBadge.label}</span>
             {user.role && (
               <span style={{ fontSize: 10, color: palette.muted }}>
-                {user.role}{user.franchise_name ? ` · ${user.franchise_name}` : ""}
+                {user.role}{user.franchise_name ? ` · ${user.franchise_name}` : ""}{user.dock_name ? ` · ${user.dock_name}` : ""}
               </span>
             )}
           </div>
@@ -4751,6 +4797,22 @@ function UserRow({ user, franchises, palette, busy, onApprove, onReject, onDisab
               <option key={f.id} value={f.id}>{f.name}</option>
             ))}
           </select>
+          <select
+            value={needsDock ? did : ""}
+            onChange={(e) => setDid(e.target.value)}
+            disabled={!needsDock || !fid || busy}
+            title={needsDock ? "Restrict to one dock (leave empty for full franchise access)" : "Dock scoping only applies to franchise_staff"}
+            style={{
+              padding: "8px 10px", borderRadius: 8, border: `1px solid ${palette.border}`,
+              fontSize: 12, fontFamily: "'Open Sans', sans-serif",
+              opacity: needsDock && fid ? 1 : 0.5,
+            }}
+          >
+            <option value="">{needsDock ? "All docks (no scope)" : "—"}</option>
+            {dockOptions.map((d) => (
+              <option key={d.id} value={d.id}>{d.name}</option>
+            ))}
+          </select>
         </div>
       ) : (
         <div style={{ fontSize: 12, color: palette.muted }}>
@@ -4763,7 +4825,7 @@ function UserRow({ user, franchises, palette, busy, onApprove, onReject, onDisab
           <>
             <button
               disabled={busy || (needsFranchise && !fid)}
-              onClick={() => onApprove(role, needsFranchise ? parseInt(fid, 10) : null)}
+              onClick={() => onApprove(role, needsFranchise ? parseInt(fid, 10) : null, needsDock ? (did || null) : null)}
               style={{
                 padding: "8px 14px", borderRadius: 8, border: "none",
                 background: "#10b981", color: "#fff", fontSize: 12, fontWeight: 600,
@@ -4782,7 +4844,7 @@ function UserRow({ user, franchises, palette, busy, onApprove, onReject, onDisab
           <>
             <button
               disabled={busy || (needsFranchise && !fid)}
-              onClick={() => onApprove(role, needsFranchise ? parseInt(fid, 10) : null)}
+              onClick={() => onApprove(role, needsFranchise ? parseInt(fid, 10) : null, needsDock ? (did || null) : null)}
               style={{
                 padding: "8px 14px", borderRadius: 8, border: `1px solid ${palette.border}`,
                 background: "transparent", color: palette.muted, fontSize: 12, fontWeight: 600,
