@@ -13,8 +13,50 @@ const session = require("express-session");
 const crypto = require("crypto");
 const path = require("path");
 const { OAuth2Client } = require("google-auth-library");
+const webpush = require("web-push");
 const db = require("./db");
 const { classifyIntent } = require("./lib/intent");
+
+// --- Web Push (PWA notifications) ---
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:admin@example.com";
+const pushEnabled = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+if (pushEnabled) {
+  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn("Web Push disabled — VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not set.");
+}
+
+// Fan out a payload to every push subscription for a franchise. Dead/expired
+// subscriptions (404/410) are pruned so the next inbound doesn't retry them.
+async function pushToFranchise(franchiseId, payload) {
+  if (!pushEnabled || !franchiseId) return;
+  const { rows } = await db.query(
+    `SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE franchise_id = $1`,
+    [franchiseId]
+  );
+  if (rows.length === 0) return;
+  const body = JSON.stringify(payload);
+  const stale = [];
+  await Promise.all(rows.map(async (sub) => {
+    try {
+      await webpush.sendNotification(
+        { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+        body
+      );
+    } catch (err) {
+      if (err && (err.statusCode === 404 || err.statusCode === 410)) {
+        stale.push(sub.id);
+      } else {
+        console.error("Push send error:", err && err.message);
+      }
+    }
+  }));
+  if (stale.length > 0) {
+    await db.query(`DELETE FROM push_subscriptions WHERE id = ANY($1::int[])`, [stale]);
+  }
+}
 
 const app = express();
 app.set("trust proxy", 1);
@@ -1064,7 +1106,7 @@ function buildSmsBody(reservation) {
   return (
     `Hi ${name.split(" ")[0]}! ` +
     `This is a reminder about your upcoming ${reservation.service || "reservation"} ` +
-    `on ${dateStr} ${timePhrase} for ${reservation.guests || 1} guest(s).\n\n` +
+    `on ${dateStr} ${timePhrase}.\n\n` +
     `Can you make it? Just reply YES to confirm, CANCEL to cancel, or send a new time (e.g. 7:30 AM) if you need to change your arrival.`
   );
 }
@@ -1553,6 +1595,16 @@ app.post("/api/sms/incoming", express.urlencoded({ extended: false }), async (re
       [franchise.id, normalizedFrom, reservation ? reservation.id : null,
        reservation ? reservation.dock_id : null, responseText]
     );
+
+    // Fire-and-forget push to all staff devices for this franchise. We don't
+    // await it because the inbound webhook needs to respond to Twilio promptly.
+    const senderName = reservation && reservation.name ? reservation.name : normalizedFrom;
+    pushToFranchise(franchise.id, {
+      title: `New SMS from ${senderName}`,
+      body: inboundText.slice(0, 160),
+      phone: normalizedFrom,
+      url: `/dashboard?phone=${encodeURIComponent(normalizedFrom)}`,
+    }).catch((e) => console.error("Push fan-out error:", e && e.message));
   } catch (err) {
     console.error("Inbound webhook error:", err);
     responseText = "We received your message but something went wrong on our end. Please try again shortly.";
@@ -1690,6 +1742,53 @@ app.get("/api/conversations/:phone", requireAuth, requireFranchiseContext, async
     });
   } catch (err) {
     console.error("Conversation fetch error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// --- Web Push subscription endpoints ---
+// The public VAPID key is fetched by the SPA so it can call subscribe() on the
+// browser's PushManager.
+app.get("/api/push/vapid-public-key", requireAuth, (req, res) => {
+  if (!pushEnabled) return res.status(503).json({ error: "Push not configured" });
+  res.json({ key: VAPID_PUBLIC_KEY });
+});
+
+app.post("/api/push/subscribe", requireAuth, requireFranchiseContext, async (req, res) => {
+  if (!pushEnabled) return res.status(503).json({ error: "Push not configured" });
+  const { endpoint, keys } = req.body || {};
+  if (!endpoint || !keys || !keys.p256dh || !keys.auth) {
+    return res.status(400).json({ error: "Invalid subscription" });
+  }
+  try {
+    await db.query(
+      `INSERT INTO push_subscriptions (user_id, franchise_id, endpoint, p256dh, auth, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (endpoint) DO UPDATE
+         SET user_id = EXCLUDED.user_id,
+             franchise_id = EXCLUDED.franchise_id,
+             p256dh = EXCLUDED.p256dh,
+             auth = EXCLUDED.auth,
+             user_agent = EXCLUDED.user_agent,
+             last_seen_at = NOW()`,
+      [req.session.userId, req.franchiseId, endpoint, keys.p256dh, keys.auth, req.headers["user-agent"] || null]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Push subscribe error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/push/unsubscribe", requireAuth, async (req, res) => {
+  const { endpoint } = req.body || {};
+  if (!endpoint) return res.status(400).json({ error: "endpoint required" });
+  try {
+    await db.query(`DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_id = $2`,
+      [endpoint, req.session.userId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Push unsubscribe error:", err);
     res.status(500).json({ error: "Database error" });
   }
 });

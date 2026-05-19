@@ -4,6 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Freedom Boat Club — Reservation Confirmations</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#0F2A44" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="FBC SMS" />
+  <link rel="apple-touch-icon" href="/icons/icon.svg" />
   <style>body { margin: 0; background: #F0F4F8; } #root { min-height: 100vh; }</style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
@@ -243,6 +249,32 @@ const api = {
   async getConversation(phone) {
     const res = await fetch(`${API_BASE}/api/conversations/${encodeURIComponent(phone)}`, {
       credentials: "same-origin",
+    });
+    return res.json();
+  },
+
+  async getVapidPublicKey() {
+    const res = await fetch(`${API_BASE}/api/push/vapid-public-key`, { credentials: "same-origin" });
+    if (!res.ok) throw new Error("vapid key fetch failed");
+    return res.json();
+  },
+
+  async subscribePush(subscription) {
+    const res = await fetch(`${API_BASE}/api/push/subscribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(subscription),
+    });
+    return res.json();
+  },
+
+  async unsubscribePush(endpoint) {
+    const res = await fetch(`${API_BASE}/api/push/unsubscribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ endpoint }),
     });
     return res.json();
   },
@@ -3340,6 +3372,131 @@ function ConversationDrawer({ phone, onClose }) {
   );
 }
 
+// ─── Web Push (PWA notifications) ───────────────────────────────
+// Browsers store the active subscription on ServiceWorkerRegistration. We mirror
+// the enable/disable bit in localStorage so the toggle reflects user intent
+// even before the SW promise resolves.
+const PUSH_PREF_KEY = "fbc_push_enabled";
+const pushSupported = () =>
+  typeof window !== "undefined" &&
+  "serviceWorker" in navigator &&
+  "PushManager" in window &&
+  "Notification" in window;
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+function NotificationToggle({ onIncoming }) {
+  const [state, setState] = useState("checking"); // checking | unsupported | denied | off | on | working
+  const [registration, setRegistration] = useState(null);
+
+  // Register the service worker once and watch for inbound push messages.
+  useEffect(() => {
+    if (!pushSupported()) { setState("unsupported"); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const reg = await navigator.serviceWorker.register("/service-worker.js");
+        if (cancelled) return;
+        setRegistration(reg);
+        const sub = await reg.pushManager.getSubscription();
+        if (Notification.permission === "denied") setState("denied");
+        else if (sub) setState("on");
+        else setState("off");
+      } catch (err) {
+        console.error("SW register failed:", err);
+        if (!cancelled) setState("unsupported");
+      }
+    })();
+    const handler = (event) => {
+      if (event.data && event.data.type === "sms-inbound" && onIncoming) {
+        onIncoming(event.data);
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", handler);
+    return () => {
+      cancelled = true;
+      navigator.serviceWorker.removeEventListener("message", handler);
+    };
+  }, [onIncoming]);
+
+  const enable = async () => {
+    if (!registration) return;
+    setState("working");
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") { setState(permission === "denied" ? "denied" : "off"); return; }
+      const { key } = await api.getVapidPublicKey();
+      const sub = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(key),
+      });
+      await api.subscribePush(sub.toJSON());
+      localStorage.setItem(PUSH_PREF_KEY, "1");
+      setState("on");
+    } catch (err) {
+      console.error("Push enable failed:", err);
+      setState("off");
+    }
+  };
+
+  const disable = async () => {
+    if (!registration) return;
+    setState("working");
+    try {
+      const sub = await registration.pushManager.getSubscription();
+      if (sub) {
+        await api.unsubscribePush(sub.endpoint);
+        await sub.unsubscribe();
+      }
+      localStorage.removeItem(PUSH_PREF_KEY);
+      setState("off");
+    } catch (err) {
+      console.error("Push disable failed:", err);
+      setState("on");
+    }
+  };
+
+  if (state === "unsupported") return null;
+
+  const palette = { border: "#D8DEE7", muted: "#5A6577", accent: "#0F2A44", accentLight: "#E8F0FC" };
+  const baseStyle = {
+    padding: "10px 14px", borderRadius: 10,
+    border: `1.5px solid ${palette.border}`,
+    background: "transparent",
+    color: palette.muted,
+    fontSize: 12, fontWeight: 600, cursor: "pointer",
+    fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+    display: "flex", alignItems: "center", gap: 6,
+  };
+
+  if (state === "denied") {
+    return (
+      <div style={{ ...baseStyle, cursor: "default", opacity: 0.7 }} title="Notifications blocked in browser settings">
+        🔕 Alerts blocked
+      </div>
+    );
+  }
+  if (state === "on") {
+    return (
+      <button onClick={disable} style={{ ...baseStyle, borderColor: palette.accent, background: palette.accentLight, color: palette.accent }}>
+        🔔 Alerts on
+      </button>
+    );
+  }
+  return (
+    <button onClick={enable} disabled={state === "working" || state === "checking"} style={baseStyle}>
+      🔔 {state === "working" ? "..." : "Enable alerts"}
+    </button>
+  );
+}
+
 // ─── Main App ────────────────────────────────────────────────────
 // ─── Super-admin franchise switcher (dropdown in header) ────────
 function SuperAdminFranchiseSwitcher({ current, onSwitched }) {
@@ -3817,6 +3974,20 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
                 🏢 {me.franchise.name}
               </div>
             )}
+            <NotificationToggle onIncoming={(payload) => {
+              dispatch({ type: "SHOW_TOAST", payload: payload.title + (payload.body ? ` — ${payload.body}` : "") });
+              try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.frequency.value = 880;
+                gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
+                osc.start(); osc.stop(ctx.currentTime + 0.42);
+              } catch {}
+            }} />
             <button
               onClick={async () => { if (onLogout) onLogout(); }}
               style={{
