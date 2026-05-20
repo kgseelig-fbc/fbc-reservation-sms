@@ -232,6 +232,26 @@ const api = {
     return res.json();
   },
 
+  async toggleSkip(id, skip) {
+    const res = await fetch(`${API_BASE}/api/reservations/${id}/skip`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ skip }),
+    });
+    return res.json();
+  },
+
+  async toggleMemberDnc(phone, dnc) {
+    const res = await fetch(`${API_BASE}/api/members/${encodeURIComponent(phone)}/dnc`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ dnc }),
+    });
+    return res.json();
+  },
+
   async simulateReply(id, reply, dockId) {
     const res = await fetch(`${API_BASE}/api/sms/simulate`, {
       method: "POST",
@@ -494,7 +514,7 @@ function reducer(state, action) {
         const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
         const outbound = {
           from: "system",
-          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr}.\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
           time: new Date(),
         };
         return { ...r, messageSent: true, messageTime: new Date(), status: r.status === "unconfirmed" ? "pending" : r.status, smsLog: [outbound] };
@@ -503,12 +523,12 @@ function reducer(state, action) {
     }
     case "SEND_ALL_REMINDERS": {
       const updated = state.reservations.map((r) => {
-        if (r.messageSent) return r;
+        if (r.messageSent || r.skipReminder) return r;
         const dateStr = r.date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
         const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
         const outbound = {
           from: "system",
-          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr}.\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
           time: new Date(),
         };
         return { ...r, messageSent: true, messageTime: new Date(), status: "pending", smsLog: [outbound] };
@@ -518,6 +538,12 @@ function reducer(state, action) {
     case "UPDATE_STATUS": {
       const updated = state.reservations.map((r) =>
         r.id === action.payload.id ? { ...r, status: action.payload.status } : r
+      );
+      return { ...state, reservations: updated };
+    }
+    case "SET_SKIP": {
+      const updated = state.reservations.map((r) =>
+        r.id === action.payload.id ? { ...r, skipReminder: action.payload.skip } : r
       );
       return { ...state, reservations: updated };
     }
@@ -603,7 +629,7 @@ function reducer(state, action) {
         const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
         const outbound = {
           from: "system",
-          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr}.\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
           time: new Date(),
         };
         return { ...r, messageSent: true, messageTime: new Date(), status: r.status === "unconfirmed" ? "pending" : r.status, smsLog: [outbound] };
@@ -650,7 +676,7 @@ function reducer(state, action) {
         const timeStr = r.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
         const outbound = {
           from: "system",
-          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr} for ${r.guests} guest(s).\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
+          text: `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} at ${timeStr}.\n\nReply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`,
           time: new Date(),
         };
         return { ...r, messageSent: true, messageTime: new Date(), status: r.status === "unconfirmed" ? "pending" : r.status, smsLog: [outbound] };
@@ -849,6 +875,27 @@ function ReservationRow({ res, isSelected, isChecked, dispatch }) {
 
         {/* Message Status & SMS */}
         <div style={{ minWidth: 110, textAlign: "center", display: "flex", gap: 6, alignItems: "center", justifyContent: "center" }}>
+          {!res.messageSent && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                dispatch({ type: "SET_SKIP", payload: { id: res.id, skip: !res.skipReminder } });
+              }}
+              title={res.skipReminder
+                ? "Skipped — bulk send will pass over this reservation. Click to un-skip."
+                : "Skip this reservation in bulk send. (You can still send individually.)"}
+              style={{
+                padding: "5px 10px", borderRadius: 8,
+                border: `1.5px solid ${res.skipReminder ? palette.amber + "60" : palette.border}`,
+                background: res.skipReminder ? palette.amberLight : "transparent",
+                color: res.skipReminder ? palette.amber : palette.muted,
+                fontSize: 11, fontWeight: 600, cursor: "pointer",
+                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
+              }}
+            >
+              {res.skipReminder ? "⏭ Skipped" : "Skip"}
+            </button>
+          )}
           {res.messageSent ? (
             <button
               onClick={(e) => {
@@ -1083,8 +1130,7 @@ function AutomationPanel({ reservations }) {
           }}>
             <span style={{ fontWeight: 600 }}>Hi {'{{name}}'},</span><br /><br />
             This is a reminder about your upcoming <span style={{ fontWeight: 600 }}>{'{{service}}'}</span> on{" "}
-            <span style={{ fontWeight: 600 }}>{'{{date}}'}</span> at <span style={{ fontWeight: 600 }}>{'{{time}}'}</span> for{" "}
-            <span style={{ fontWeight: 600 }}>{'{{guests}}'}</span> guest(s).<br /><br />
+            <span style={{ fontWeight: 600 }}>{'{{date}}'}</span> at <span style={{ fontWeight: 600 }}>{'{{time}}'}</span>.<br /><br />
             Reply:<br />
             <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
               • <span style={{ background: palette.greenLight, padding: "1px 8px", borderRadius: 4, fontWeight: 600 }}>CONFIRM</span> to confirm
@@ -1147,7 +1193,7 @@ function SmsComposeModal({ compose, reservations, dispatch, onSend }) {
       : null;
     const timePhrase = endStr ? `from ${timeStr} to ${endStr}` : `at ${timeStr}`;
     return (
-      `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} ${timePhrase} for ${r.guests} guest(s).\n\n` +
+      `Hi ${r.name.split(" ")[0]}! This is a reminder about your upcoming ${r.service} on ${dateStr} ${timePhrase}.\n\n` +
       `Reply:\n• CONFIRM to confirm\n• CANCEL to cancel\n• TIME [new time] to update your arrival (e.g. TIME 7:30 PM)`
     );
   };
@@ -2340,7 +2386,7 @@ function BatchDetailDrawer({ batchId, onClose }) {
 function BulkActionBar({ count, dispatch, reservations, selected }) {
   const selectedRes = reservations.filter((r) => selected.has(r.id));
   const confirmableCount = selectedRes.filter((r) => r.status !== "confirmed" && r.status !== "cancelled").length;
-  const unsentCount = selectedRes.filter((r) => !r.messageSent).length;
+  const unsentCount = selectedRes.filter((r) => !r.messageSent && !r.skipReminder).length;
 
   return (
     <div style={{
@@ -3137,6 +3183,7 @@ function ConversationDrawer({ phone, onClose }) {
   const [replyText, setReplyText] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
+  const [dncBusy, setDncBusy] = useState(false);
   const scrollRef = useRef(null);
 
   const load = useCallback(async () => {
@@ -3187,6 +3234,31 @@ function ConversationDrawer({ phone, onClose }) {
   const messages = (data && data.messages) || [];
   const reservations = (data && data.reservations) || [];
   const homeFranchises = (data && data.homeFranchises) || [];
+  const dnc = !!(data && data.member && data.member.do_not_contact);
+
+  const toggleDnc = async () => {
+    if (dncBusy) return;
+    setDncBusy(true);
+    const next = !dnc;
+    // Optimistic update.
+    setData((d) => d && d.member
+      ? { ...d, member: { ...d.member, do_not_contact: next } }
+      : d);
+    try {
+      const r = await api.toggleMemberDnc(phone, next);
+      if (!r || !r.success) {
+        setData((d) => d && d.member
+          ? { ...d, member: { ...d.member, do_not_contact: !next } }
+          : d);
+      }
+    } catch {
+      setData((d) => d && d.member
+        ? { ...d, member: { ...d.member, do_not_contact: !next } }
+        : d);
+    } finally {
+      setDncBusy(false);
+    }
+  };
 
   return (
     <div style={{
@@ -3235,6 +3307,26 @@ function ConversationDrawer({ phone, onClose }) {
             {phone} · {reservations.length} reservation{reservations.length === 1 ? "" : "s"}
           </div>
         </div>
+        {data && data.member && (
+          <button
+            onClick={toggleDnc}
+            disabled={dncBusy}
+            title={dnc
+              ? "This member is set to do-not-contact. Future imports will auto-skip their reservations. Click to clear."
+              : "Mark this member as do-not-contact. Future imports will auto-skip their reservations from bulk send."}
+            style={{
+              padding: "6px 10px", borderRadius: 8,
+              border: `1.5px solid ${dnc ? palette.amber + "60" : palette.border}`,
+              background: dnc ? palette.amberLight : "transparent",
+              color: dnc ? palette.amber : palette.muted,
+              fontSize: 10, fontWeight: 700, cursor: dncBusy ? "not-allowed" : "pointer",
+              fontFamily: "'Open Sans', sans-serif", flexShrink: 0,
+              opacity: dncBusy ? 0.6 : 1,
+            }}
+          >
+            {dnc ? "DNC ✓" : "DNC"}
+          </button>
+        )}
       </div>
 
       <div ref={scrollRef} style={{
@@ -3679,7 +3771,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
     cancelled: state.reservations.filter((r) => r.status === "cancelled").length,
   };
 
-  const unsent = state.reservations.filter((r) => !r.messageSent).length;
+  const unsent = state.reservations.filter((r) => !r.messageSent && !r.skipReminder).length;
 
   // Helper to refresh data from server
   const refreshFromServer = async () => {
@@ -3733,8 +3825,10 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
         break;
       }
       case "SEND_ALL_REMINDERS": {
-        // Open compose modal for all unsent
-        const unsentIds = state.reservations.filter((r) => !r.messageSent).map((r) => r.id);
+        // Open compose modal for all unsent — skipped reservations are
+        // excluded here too so the count in the compose modal matches what
+        // the server will actually send.
+        const unsentIds = state.reservations.filter((r) => !r.messageSent && !r.skipReminder).map((r) => r.id);
         dispatch({ type: "OPEN_COMPOSE", payload: { id: unsentIds, mode: "bulk" } });
         break;
       }
@@ -3748,12 +3842,13 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
         try {
           const result = await api.sendBulk(action.ids, state.currentDock);
           if (result.success) {
-            const { sent, failed, requested, skippedNoPhone, skippedAlreadySent } = result;
+            const { sent, failed, requested, skippedNoPhone, skippedAlreadySent, skippedFlagged } = result;
             const parts = [];
             if (sent > 0) parts.push(`${sent} sent`);
             if (failed > 0) parts.push(`${failed} failed`);
             if (skippedNoPhone > 0) parts.push(`${skippedNoPhone} skipped (no phone)`);
             if (skippedAlreadySent > 0) parts.push(`${skippedAlreadySent} skipped (already messaged)`);
+            if (skippedFlagged > 0) parts.push(`${skippedFlagged} skipped (opted out)`);
             const summary = parts.length ? parts.join(", ") : "0 sent";
             dispatch({ type: "SHOW_TOAST", payload: `${summary} of ${requested}` });
             dispatch({ type: "DESELECT_ALL" });
@@ -3770,6 +3865,23 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           dispatch(action);
         } catch {
           dispatch(action); // fallback to local
+        }
+        break;
+      }
+      case "SET_SKIP": {
+        // Optimistic update first so the UI reflects the toggle instantly;
+        // refresh from server is unnecessary since the row state is local.
+        dispatch(action);
+        try {
+          const r = await api.toggleSkip(action.payload.id, action.payload.skip);
+          if (!r || !r.success) {
+            dispatch({ type: "SHOW_TOAST", payload: `Skip toggle failed: ${(r && r.error) || "unknown"}` });
+            // Revert on failure
+            dispatch({ type: "SET_SKIP", payload: { id: action.payload.id, skip: !action.payload.skip } });
+          }
+        } catch {
+          dispatch({ type: "SHOW_TOAST", payload: "Network error toggling skip" });
+          dispatch({ type: "SET_SKIP", payload: { id: action.payload.id, skip: !action.payload.skip } });
         }
         break;
       }

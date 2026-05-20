@@ -872,6 +872,7 @@ function rowToReservation(r) {
     timeUpdated: !!r.time_updated,
     originalTime: r.original_time,
     pendingTimeChange: r.pending_time_change || null,
+    skipReminder: !!r.skip_reminder,
     dock: r.dock_id,
     sourceId: r.source_id,
     franchiseId: r.franchise_id,
@@ -989,21 +990,31 @@ app.post("/api/reservations/import", requireAuth, requireFranchiseContext, async
         const reservationId = `F${req.franchiseId}-${prefix}-B${batchId}-${String(i + 1).padStart(3, "0")}`;
         const normalizedPhone = r.phone ? normalizePhone(r.phone) : "";
 
+        // If this member has been flagged do-not-contact, mark the new
+        // reservation skip_reminder=TRUE so it's auto-excluded from bulk send.
+        let skipReminder = false;
         if (normalizedPhone) {
           await upsertMember(c, req.franchiseId, normalizedPhone, r.name, r.email);
+          const { rows: dncRows } = await c.query(
+            `SELECT do_not_contact FROM members WHERE franchise_id = $1 AND phone = $2`,
+            [req.franchiseId, normalizedPhone]
+          );
+          skipReminder = !!(dncRows[0] && dncRows[0].do_not_contact);
         }
 
         await c.query(
           `INSERT INTO reservations
            (id, franchise_id, import_batch_id, source_id, dock_id, phone, name, email, service,
             reservation_date, return_time, guests, status, channel, notes,
-            member_mobile, contact_mobile, contact_home_phone, contact_phone, location_info)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+            member_mobile, contact_mobile, contact_home_phone, contact_phone, location_info,
+            skip_reminder)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
           [
             reservationId, req.franchiseId, batchId, sourceId, dockId, normalizedPhone,
             r.name || `Guest ${i + 1}`, r.email || "", r.service || "Reservation",
             r.date || null, r.endTime || null, r.guests || 1, r.status || "unconfirmed", r.channel || "sms", r.notes || "",
             r.memberMobile || "", r.contactMobile || "", r.contactHomePhone || "", r.contactPhone || "", r.locationInfo || "",
+            skipReminder,
           ]
         );
       }
@@ -1146,6 +1157,29 @@ app.post("/api/reservations/:id/status", requireAuth, requireFranchiseContext, a
     res.json({ success: true, reservation: rowToReservation(rows[0]) });
   } catch (err) {
     console.error("Status update error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Toggle the skip_reminder flag on a single reservation. Bulk send filters out
+// reservations where this is TRUE; the individual Send button still works so
+// staff can override the skip for one row if they change their mind.
+app.post("/api/reservations/:id/skip", requireAuth, requireFranchiseContext, async (req, res) => {
+  const { id } = req.params;
+  const skip = !!(req.body && req.body.skip);
+  try {
+    const inScope = await loadReservationInScope(req, res, id);
+    if (!inScope) return;
+    const { rows } = await db.query(
+      `UPDATE reservations SET skip_reminder = $1
+       WHERE id = $2 AND franchise_id = $3
+       RETURNING *`,
+      [skip, id, req.franchiseId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Reservation not found" });
+    res.json({ success: true, reservation: rowToReservation(rows[0]) });
+  } catch (err) {
+    console.error("Skip toggle error:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -1338,7 +1372,8 @@ app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req,
   const requested = candidates.length;
   const skippedNoPhone = candidates.filter((r) => !r.phone).length;
   const skippedAlreadySent = candidates.filter((r) => r.phone && r.message_sent).length;
-  const targets = candidates.filter((r) => r.phone && !r.message_sent);
+  const skippedFlagged = candidates.filter((r) => r.phone && !r.message_sent && r.skip_reminder).length;
+  const targets = candidates.filter((r) => r.phone && !r.message_sent && !r.skip_reminder);
 
   const results = { sent: 0, failed: 0, errors: [] };
   for (const r of targets) {
@@ -1351,7 +1386,7 @@ app.post("/api/sms/send-bulk", requireAuth, requireFranchiseContext, async (req,
       results.errors.push({ id: r.id, error: err.message });
     }
   }
-  res.json({ success: true, requested, skippedNoPhone, skippedAlreadySent, ...results });
+  res.json({ success: true, requested, skippedNoPhone, skippedAlreadySent, skippedFlagged, ...results });
 });
 
 // --- Admin chat box — send arbitrary SMS to a reservation's phone ---
@@ -1569,7 +1604,7 @@ app.get("/api/members", requireAuth, requireFranchiseContext, async (req, res) =
     // Dock-scoped users only see members who have at least one reservation at
     // their dock (in this franchise). Admins see all members in the franchise.
     const { rows } = await db.query(
-      `SELECT m.phone, m.name, m.email, m.first_seen, m.last_seen
+      `SELECT m.phone, m.name, m.email, m.first_seen, m.last_seen, m.do_not_contact
          FROM members m
         WHERE m.franchise_id = $1
           AND ($2 = ''
@@ -1586,6 +1621,39 @@ app.get("/api/members", requireAuth, requireFranchiseContext, async (req, res) =
     res.json({ members: rows });
   } catch (err) {
     console.error("List members error:", err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Toggle the member-level do-not-contact flag. Dock-scoped staff may only flip
+// it on members who have a reservation at their dock — otherwise it's a
+// franchise-wide flag and admins maintain it.
+app.post("/api/members/:phone/dnc", requireAuth, requireFranchiseContext, async (req, res) => {
+  const phone = normalizePhone(req.params.phone);
+  const dnc = !!(req.body && req.body.dnc);
+  if (!phone) return res.status(400).json({ error: "Invalid phone" });
+  const scope = userDockScope(req);
+  try {
+    if (scope) {
+      const { rows: check } = await db.query(
+        `SELECT 1 FROM reservations
+          WHERE franchise_id = $1 AND phone = $2 AND dock_id = $3 LIMIT 1`,
+        [req.franchiseId, phone, scope]
+      );
+      if (check.length === 0) {
+        return res.status(403).json({ error: "Forbidden: member is not in your dock's scope" });
+      }
+    }
+    const { rows } = await db.query(
+      `UPDATE members SET do_not_contact = $1
+        WHERE franchise_id = $2 AND phone = $3
+        RETURNING phone, name, email, do_not_contact`,
+      [dnc, req.franchiseId, phone]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Member not found" });
+    res.json({ success: true, member: rows[0] });
+  } catch (err) {
+    console.error("DNC toggle error:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
