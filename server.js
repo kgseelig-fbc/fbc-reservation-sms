@@ -1248,7 +1248,7 @@ app.post("/api/reservations/:id/reject-time-change", requireAuth, requireFranchi
     );
     try {
       await sendAndLogSms(req.franchise, updated[0],
-        `Sorry — ${requestedTimeStr} isn't available. Your reservation remains at ${originalTimeStr}. Reply YES to confirm or CANCEL if you can't make it.`,
+        `Sorry — ${requestedTimeStr} isn't available. Your reservation remains at ${originalTimeStr}. Reply YES to confirm or NO if you can't make it.`,
         req.session.userId);
     } catch (err) {
       console.error("Reject time-change SMS error:", err.message);
@@ -1276,7 +1276,7 @@ function buildSmsBody(reservation) {
     `Hi ${name.split(" ")[0]}! ` +
     `This is a reminder about your upcoming ${reservation.service || "reservation"} ` +
     `on ${dateStr} ${timePhrase}.\n\n` +
-    `Can you make it? Just reply YES to confirm, CANCEL to cancel, or send a new time (e.g. 7:30 AM) if you need to change your arrival.`
+    `Can you make it? Reply YES to confirm and NO to cancel, or send a new time (e.g. 7:30 AM) if you need to change your arrival.`
   );
 }
 
@@ -1674,12 +1674,12 @@ const CONFIRM_RESPONSE = "Thank you! Your reservation is confirmed. We look forw
 const CANCEL_RESPONSE = "Your reservation has been cancelled. If you change your mind, please call us to rebook.";
 const HANDOFF_RESPONSE =
   "Thanks for reaching out! A team member will follow up with you shortly.\n\n" +
-  "If you also want to confirm or change this reservation, reply YES, CANCEL, " +
+  "If you also want to confirm or change this reservation, reply YES, NO, " +
   "or a new time like \"7:30 AM\".";
 const ROBOTIC_FALLBACK =
   "Sorry, I didn't quite catch that. You can reply:\n" +
   "• YES to confirm\n" +
-  "• CANCEL to cancel\n" +
+  "• NO to cancel\n" +
   "• A new time like \"7:30 AM\" to change your arrival";
 
 async function applyCancel(reservation) {
