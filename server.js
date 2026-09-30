@@ -240,6 +240,83 @@ async function loadReservationInScope(req, res, reservationId) {
   return rows[0];
 }
 
+// --- Hub-trust auth (fbcnefl.com staff hub) ---
+// When this instance runs behind the hub's Cloudflare auth-worker, the worker
+// authenticates staff against the hub's own session store and forwards their
+// identity along with a shared secret. If the secret checks out, establish the
+// same session the Google flow would have — hub users never see a second
+// login. Requests that reach Railway directly never carry the secret, so they
+// fall through to the normal (Google) auth and get nothing.
+const hubOriginSecret = process.env.HUB_ORIGIN_SECRET || null;
+
+// Hub "location" strings are free-form ("Jax Beach", "Julington Creek West",
+// "Camachee Cove", ...). Map them onto dock ids for Manager dock-scoping.
+function hubLocationToDockId(location) {
+  const l = (location || "").toLowerCase();
+  if (!l) return null;
+  if (l.includes("jax")) return "jax-beach";
+  if (l.includes("west") || l === "jcw") return "julington-west";
+  if (l.includes("julington") || l === "jc") return "julington-east";
+  if (l.includes("camachee")) return "camachee-cove";
+  if (l.includes("shipyard")) return "shipyard";
+  return null;
+}
+
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+app.use(async (req, res, next) => {
+  if (!hubOriginSecret) return next();
+  const secret = req.headers["x-origin-auth"];
+  const email = String(req.headers["x-hub-email"] || "").toLowerCase().trim();
+  if (!secret || !email || !safeEqual(secret, hubOriginSecret)) return next();
+  // Already signed in as this person — nothing to do.
+  if (req.session && req.session.userId && req.session.email === email) return next();
+
+  const hubRole = String(req.headers["x-hub-role"] || "");
+  const name = String(req.headers["x-hub-name"] || "") || null;
+  const dockId = hubRole === "Manager" ? hubLocationToDockId(req.headers["x-hub-location"]) : null;
+
+  try {
+    const { rows } = await db.query(`SELECT * FROM users WHERE email = $1 LIMIT 1`, [email]);
+    let user = rows[0];
+    if (!user) {
+      // The worker only proxies Admin/Manager hub sessions, but enforce it
+      // here too so a worker bug can't mint accounts for other roles.
+      if (hubRole !== "Admin" && hubRole !== "Manager") return next();
+      const role = hubRole === "Admin" ? "franchise_admin" : "franchise_staff";
+      const inserted = await db.query(
+        `INSERT INTO users (email, name, role, franchise_id, dock_id, status, approved_at)
+         VALUES ($1, $2, $3, 1, $4, 'approved', NOW())
+         ON CONFLICT (email) DO UPDATE SET last_login = NOW()
+         RETURNING *`,
+        [email, name, role, role === "franchise_staff" ? dockId : null]
+      );
+      user = inserted.rows[0];
+    } else {
+      await db.query(
+        `UPDATE users SET name = COALESCE(name, $1), last_login = NOW() WHERE id = $2`,
+        [name, user.id]
+      );
+    }
+    if (user.status !== "approved") return next();
+
+    req.session.userId = user.id;
+    req.session.email = user.email;
+    req.session.role = user.role;
+    req.session.status = user.status;
+    req.session.franchiseId = user.franchise_id;
+    req.session.activeFranchiseId = user.franchise_id || 1;
+    req.session.dockId = user.dock_id || null;
+  } catch (err) {
+    console.error("Hub-trust auth failed:", err.message);
+  }
+  next();
+});
+
 // Returns the public origin of this request so OAuth redirects point at the UI the
 // user came from. Falls back to host header.
 function originFromRequest(req) {
