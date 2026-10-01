@@ -1813,11 +1813,11 @@ async function parseAndApplyReply(inboundText, reservation) {
 
   if (!reservation) {
     return "Hi there! Who are you trying to connect with? This is the Freedom Boat Club reservations line. You can reach your dock directly:\n" +
-      "• Jax Beach: 904-562-8676\n" +
-      "• Julington Creek: 904-625-1847\n" +
-      "• Julington Creek West: 904-874-6314\n" +
-      "• St. Augustine (Camachee): 904-562-8842\n" +
-      "• St. Augustine (Shipyard): 904-710-1358";
+      "• Jacksonville Beach: 904-562-8676\n" +
+      "• Julington Creek East: 904-625-1847\n" +
+      "• Julington Creek West (Pontoons Only): 904-874-6314\n" +
+      "• Camachee Cove: 904-562-8842\n" +
+      "• St. Augustine Shipyard: 904-710-1358";
   }
 
   // Tier 1 — strict patterns. Catches the common short replies instantly
