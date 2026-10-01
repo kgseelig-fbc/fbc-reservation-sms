@@ -1812,7 +1812,7 @@ async function parseAndApplyReply(inboundText, reservation) {
   const handoffOrInquiry = /(human|real person|talk to|speak to|chat with|customer service|live person|representative|\bagent\b|\bmanager\b|do you have|any boats|boats? avail|any avail|any open|any slot|any free|reservation for|reserve a|book (a|another)|want to book|new booking)/;
 
   if (!reservation) {
-    return "Sorry, we couldn't find a reservation associated with this number. Please call us directly for assistance.";
+    return "Hi there! Who are you trying to connect with? This is the Freedom Boat Club reservations line — reply with your name and dock and a team member will follow up, or call us directly.";
   }
 
   // Tier 1 — strict patterns. Catches the common short replies instantly
