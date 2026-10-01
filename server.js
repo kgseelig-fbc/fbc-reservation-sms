@@ -1849,7 +1849,8 @@ async function parseAndApplyReply(inboundText, reservation) {
   const handoffOrInquiry = /(human|real person|talk to|speak to|chat with|customer service|live person|representative|\bagent\b|\bmanager\b|do you have|any boats|boats? avail|any avail|any open|any slot|any free|reservation for|reserve a|book (a|another)|want to book|new booking)/;
 
   if (!reservation) {
-    return "Hi there! Who are you trying to connect with? This is the Freedom Boat Club reservations line. You can reach your dock directly:\n" +
+    return "Hi there! This line is primarily for confirming or updating a reservation. How can we help, or who are you looking to contact?\n\n" +
+      "For Member Service, call 904-544-4204. Or reach your dock directly:\n" +
       "• Jacksonville Beach: 904-562-8676\n" +
       "• Julington Creek East: 904-625-1847\n" +
       "• Julington Creek West (Pontoons Only): 904-874-6314\n" +
