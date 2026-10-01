@@ -1341,8 +1341,18 @@ function AutomationPanel({ reservations }) {
 }
 
 // ─── SMS Compose Modal ──────────────────────────────────────────
-function SmsComposeModal({ compose, reservations, dispatch, onSend }) {
+function SmsComposeModal({ compose, reservations, dockName, dispatch, onSend }) {
   const { id, mode } = compose;
+  const dn = dockName ? `FBC ${dockName}` : "Freedom Boat Club";
+  // Quick-pick message presets staff can drop in before approving the send.
+  const PRESETS = [
+    { label: "Confirmation (ETA)",
+      text: `Good evening! This is the ${dn} reservation line. Please confirm your reservation for tomorrow with an ETA, or let us know if you need to cancel. Thanks!` },
+    { label: "Small craft — closed all day",
+      text: `Good evening, this is the ${dn} reservation line. Due to a small craft advisory, the docks are closed all day tomorrow and your reservation is cancelled. We're sorry for the inconvenience and hope to see you on the water soon.` },
+    { label: "Small craft — delayed opening",
+      text: `Good evening, this is the ${dn} reservation line. Due to a small craft advisory, we expect a delayed opening tomorrow. We'll follow up with timing — please hold tight before heading to the dock. Thanks for your patience!` },
+  ];
 
   // Build default message for single or first reservation
   const res = mode === "single" ? reservations.find((r) => r.id === id) : null;
@@ -1452,7 +1462,23 @@ function SmsComposeModal({ compose, reservations, dispatch, onSend }) {
           <div style={{
             fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 0.8,
             textTransform: "uppercase", marginBottom: 8, fontFamily: "'Open Sans', sans-serif",
-          }}>Message</div>
+          }}>Quick messages</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
+            {PRESETS.map((p) => (
+              <button key={p.label} onClick={() => setBody(p.text)}
+                style={{
+                  fontSize: 12, fontWeight: 600, fontFamily: "'Open Sans', sans-serif",
+                  padding: "7px 12px", borderRadius: 9, cursor: "pointer", textAlign: "left",
+                  background: body === p.text ? palette.accentLight : palette.card,
+                  color: body === p.text ? palette.accent : palette.dark,
+                  border: `1.5px solid ${body === p.text ? palette.accent : palette.border}`,
+                }}>{p.label}</button>
+            ))}
+          </div>
+          <div style={{
+            fontSize: 10, color: palette.muted, fontWeight: 600, letterSpacing: 0.8,
+            textTransform: "uppercase", marginBottom: 8, fontFamily: "'Open Sans', sans-serif",
+          }}>Message — review before sending</div>
           <textarea
             value={body}
             onChange={(e) => setBody(e.target.value)}
@@ -4669,6 +4695,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
         <SmsComposeModal
           compose={state.smsCompose}
           reservations={state.reservations}
+          dockName={DOCKS.find((d) => d.id === state.currentDock)?.name || ""}
           dispatch={dispatch}
           onSend={liveDispatch}
         />
