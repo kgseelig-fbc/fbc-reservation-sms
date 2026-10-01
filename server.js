@@ -1306,7 +1306,8 @@ app.post("/api/reservations/:id/approve-time-change", requireAuth, requireFranch
            time_updated = TRUE,
            original_time = COALESCE(original_time, $2),
            pending_time_change = NULL,
-           status = 'confirmed'
+           status = 'confirmed',
+           needs_sf_push = TRUE
        WHERE id = $3
        RETURNING *`,
       [reservation.pending_time_change, originalTime, id]
@@ -1826,14 +1827,39 @@ async function applyConfirm(reservation) {
 // proposed time on the reservation row and surface it in the dashboard for
 // staff to approve or reject. The customer gets a "we'll check" reply.
 async function flagTimeChangeRequest(reservation, hour, minute) {
-  const dateObj = new Date(reservation.reservation_date);
-  dateObj.setHours(hour, minute, 0, 0);
+  const start = new Date(reservation.reservation_date);
+  const requested = new Date(start);
+  requested.setHours(hour, minute, 0, 0);
+  const end = reservation.return_time ? new Date(reservation.return_time) : null;
+  const newTimeStr = requested.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+
+  // Within the member's existing window (requested arrival is at/after their
+  // booked start and at/before their end) → auto-apply. We move ONLY the
+  // start time; the end stays put. Anything outside the window (e.g. wanting
+  // to come in earlier than their slot opens) needs staff approval.
+  const withinWindow = end && !isNaN(end.getTime()) &&
+    requested.getTime() >= start.getTime() && requested.getTime() <= end.getTime();
+
+  if (withinWindow) {
+    await db.query(
+      `UPDATE reservations
+         SET reservation_date = $1,
+             time_updated = TRUE,
+             original_time = COALESCE(original_time, $2),
+             pending_time_change = NULL,
+             status = 'confirmed',
+             needs_sf_push = TRUE
+       WHERE id = $3`,
+      [requested.toISOString(), reservation.reservation_date, reservation.id]
+    );
+    return `You're all set — we've updated your arrival to ${newTimeStr}. See you then!`;
+  }
+
   await db.query(
     `UPDATE reservations SET pending_time_change = $1 WHERE id = $2`,
-    [dateObj.toISOString(), reservation.id]
+    [requested.toISOString(), reservation.id]
   );
-  const newTimeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-  return `Thanks! We'll check availability for ${newTimeStr} and confirm shortly.`;
+  return `Thanks! ${newTimeStr} is outside your booked window, so we'll check with the dock and confirm shortly.`;
 }
 
 async function parseAndApplyReply(inboundText, reservation) {
@@ -2189,6 +2215,51 @@ try {
 app.get("/api/version", (req, res) => {
   res.set("Cache-Control", "no-store");
   res.json({ version: APP_VERSION });
+});
+
+// --- Salesforce time-sync (Mac cron pulls these, writes B25__Start__c) ---
+// Authed by the shared hub-origin secret (same header the worker/SF pusher
+// already use), not a user session — this is machine-to-machine.
+function requireOriginSecret(req, res, next) {
+  const secret = req.headers["x-origin-auth"];
+  if (!hubOriginSecret || !secret || !safeEqual(secret, hubOriginSecret)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+// Reservations whose start time changed via SMS and still need pushing to SF.
+// Only rows with a real SF reservation id (source_id) are returned.
+app.get("/api/sf-sync/pending", requireOriginSecret, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, source_id, reservation_date, return_time, name, dock_id
+         FROM reservations
+        WHERE needs_sf_push = TRUE
+          AND source_id ~ '^[a-zA-Z0-9]{15,18}$'
+        ORDER BY reservation_date ASC
+        LIMIT 200`
+    );
+    res.json({ pending: rows });
+  } catch (err) {
+    console.error("sf-sync pending error:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Clear the flag for rows the Mac successfully pushed to SF.
+app.post("/api/sf-sync/ack", requireOriginSecret, async (req, res) => {
+  const ids = Array.isArray(req.body.ids) ? req.body.ids.filter((x) => typeof x === "string") : [];
+  if (ids.length === 0) return res.json({ cleared: 0 });
+  try {
+    const { rowCount } = await db.query(
+      `UPDATE reservations SET needs_sf_push = FALSE WHERE id = ANY($1::text[])`, [ids]
+    );
+    res.json({ cleared: rowCount });
+  } catch (err) {
+    console.error("sf-sync ack error:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 // --- Confirmation message template (admins edit, everyone's sends use it) ---
