@@ -4253,20 +4253,8 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
                 }}
               >Feedback</button>
             )}
-            <button
-              onClick={() => dispatch({ type: "SET_VIEW", payload: "upload" })}
-              style={{
-                padding: "10px 22px", borderRadius: 10,
-                border: `1.5px solid ${state.view === "upload" ? palette.accent : palette.border}`,
-                background: state.view === "upload" ? palette.accentLight : "transparent",
-                color: state.view === "upload" ? palette.accent : palette.muted,
-                fontSize: 13, fontWeight: 600, cursor: "pointer",
-                fontFamily: "'Open Sans', sans-serif", transition: "all 0.15s",
-                display: "flex", alignItems: "center", gap: 6,
-              }}
-            >
-              <span style={{ fontSize: 15 }}>↑</span> Upload
-            </button>
+            {/* Manual Upload hidden — reservations auto-load from Salesforce
+                each afternoon. Re-enable this button to restore manual import. */}
             {state.currentDock && !isDockScoped && (
               <button
                 onClick={() => dispatch({ type: "SWITCH_DOCK" })}
@@ -4399,16 +4387,19 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
           <UsersPanel palette={palette} />
         ) : state.view === "feedback" && me && me.user && me.user.role === "super_admin" ? (
           <AdminFeedbackPanel palette={palette} />
-        ) : state.view === "upload" || (state.view === "reservations" && state.reservations.length === 0) ? (
-          <UploadPanel
-            dockId={state.currentDock}
-            dockName={DOCKS.find((d) => d.id === state.currentDock)?.name || ""}
-            onOpenBatch={(id) => dispatch({ type: "OPEN_BATCH", payload: id })}
-            dispatch={(action) => {
-              liveDispatch(action);
-              if (action.type === "LOAD_DATA") dispatch({ type: "SET_VIEW", payload: "reservations" });
-            }}
-          />
+        ) : state.view === "reservations" && state.reservations.length === 0 ? (
+          <div style={{
+            padding: "60px 24px", textAlign: "center", color: palette.muted,
+            fontFamily: "'Open Sans', sans-serif",
+          }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>⚓</div>
+            <div style={{ fontSize: 16, fontWeight: 600, color: palette.dark, marginBottom: 6 }}>
+              No reservations loaded yet
+            </div>
+            <div style={{ fontSize: 13, lineHeight: 1.5, maxWidth: 360, margin: "0 auto" }}>
+              Tomorrow's reservations load automatically from Salesforce each afternoon. Check back after they sync, or pick a different dock.
+            </div>
+          </div>
         ) : state.view === "activity" ? (
           <ActivityPanel onOpen={(id) => dispatch({ type: "OPEN_BATCH", payload: id })} />
         ) : state.view === "reservations" ? (
