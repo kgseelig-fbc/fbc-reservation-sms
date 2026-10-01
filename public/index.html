@@ -3839,6 +3839,28 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
 
   const isMobile = useIsMobile();
   const [apiStatus, setApiStatus] = useState(api.isLive() ? "connecting" : "local"); // local | connecting | connected | error
+
+  // Auto-update: reload when the server reports a newer frontend version, so
+  // home-screen PWAs don't get stuck on a stale build. Checks on load, when
+  // the app regains focus, and every few minutes.
+  useEffect(() => {
+    if (!api.isLive()) return;
+    let loadedVersion = null;
+    const check = async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/version`, { cache: "no-store", credentials: "same-origin" });
+        const { version } = await r.json();
+        if (!version) return;
+        if (loadedVersion && version !== loadedVersion) { window.location.reload(); return; }
+        if (!loadedVersion) loadedVersion = version;
+      } catch (_) {}
+    };
+    check();
+    const onVis = () => { if (document.visibilityState === "visible") check(); };
+    document.addEventListener("visibilitychange", onVis);
+    const iv = setInterval(check, 120000);
+    return () => { document.removeEventListener("visibilitychange", onVis); clearInterval(iv); };
+  }, []);
   const [unreadCount, setUnreadCount] = useState(0);
 
   // App-wide poll for conversation unread count. Runs regardless of which

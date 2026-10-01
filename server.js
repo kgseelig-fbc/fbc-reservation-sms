@@ -2177,6 +2177,20 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// App version = short hash of the served frontend. The client polls this and
+// reloads itself when it changes, so home-screen PWAs pick up new deploys
+// without a manual refresh.
+let APP_VERSION = "dev";
+try {
+  APP_VERSION = crypto.createHash("sha1")
+    .update(require("fs").readFileSync(path.join(__dirname, "public", "index.html")))
+    .digest("hex").slice(0, 12);
+} catch (_) {}
+app.get("/api/version", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ version: APP_VERSION });
+});
+
 // --- Confirmation message template (admins edit, everyone's sends use it) ---
 app.get("/api/message-template", requireAuth, requireFranchiseContext, (req, res) => {
   res.json({
