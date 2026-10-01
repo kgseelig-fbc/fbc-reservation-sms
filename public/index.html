@@ -83,6 +83,31 @@ const api = {
     return res.json();
   },
 
+  async getMessageTemplate() {
+    const res = await fetch(`${API_BASE}/api/message-template`, { credentials: "same-origin" });
+    return res.json();
+  },
+
+  async previewMessageTemplate(template) {
+    const res = await fetch(`${API_BASE}/api/message-template/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ template }),
+    });
+    return res.json();
+  },
+
+  async saveMessageTemplate(template) {
+    const res = await fetch(`${API_BASE}/api/message-template`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ template }),
+    });
+    return res.json();
+  },
+
   async assignUserDock(id, dockId) {
     const res = await fetch(`${API_BASE}/api/admin/users/${id}/dock`, {
       method: "POST",
@@ -1045,6 +1070,123 @@ function ReservationRow({ res, isSelected, isChecked, dispatch }) {
   );
 }
 
+// ─── Confirmation Message Editor ─────────────────────────────────
+function MessageTemplateEditor() {
+  const [template, setTemplate] = useState("");
+  const [original, setOriginal] = useState("");
+  const [def, setDef] = useState("");
+  const [placeholders, setPlaceholders] = useState([]);
+  const [preview, setPreview] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const taRef = useRef(null);
+
+  useEffect(() => {
+    api.getMessageTemplate().then((d) => {
+      setTemplate(d.template || ""); setOriginal(d.template || "");
+      setDef(d.default || ""); setPlaceholders(d.placeholders || []);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (loading) return;
+    const t = setTimeout(() => {
+      api.previewMessageTemplate(template).then((d) => setPreview(d.preview || "")).catch(() => {});
+    }, 300);
+    return () => clearTimeout(t);
+  }, [template, loading]);
+
+  const insert = (token) => {
+    const ta = taRef.current;
+    if (!ta) { setTemplate(template + token); return; }
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const next = template.slice(0, s) + token + template.slice(e);
+    setTemplate(next);
+    setTimeout(() => { ta.focus(); ta.selectionStart = ta.selectionEnd = s + token.length; }, 0);
+  };
+
+  const save = async () => {
+    setSaving(true); setSaved(false);
+    try {
+      const d = await api.saveMessageTemplate(template);
+      if (d && d.success) { setOriginal(d.template); setTemplate(d.template); setSaved(true); setTimeout(() => setSaved(false), 2500); }
+      else alert((d && d.error) || "Could not save.");
+    } catch (_) { alert("Could not save."); }
+    setSaving(false);
+  };
+
+  const dirty = template !== original;
+  const chars = template.length;
+
+  if (loading) return null;
+
+  return (
+    <div style={{
+      background: palette.card, borderRadius: 14, padding: "22px 24px",
+      border: `1px solid ${palette.border}`, boxShadow: palette.shadow, marginBottom: 24,
+    }}>
+      <div style={{ fontSize: 16, fontWeight: 700, color: palette.dark, fontFamily: "'Montserrat', sans-serif" }}>
+        Confirmation Message
+      </div>
+      <div style={{ fontSize: 13, color: palette.muted, marginBottom: 16, fontFamily: "'Open Sans', sans-serif" }}>
+        The text members receive when you send a confirmation. Tap a tag to drop in their info.
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+        {placeholders.map((p) => (
+          <button key={p.token} onClick={() => insert(p.token)} title={p.label}
+            style={{
+              fontSize: 12, fontWeight: 600, fontFamily: "'Open Sans', sans-serif",
+              padding: "5px 10px", borderRadius: 8, cursor: "pointer",
+              background: palette.blueLight, color: palette.blue, border: `1px solid ${palette.blue}22`,
+            }}>{p.token}</button>
+        ))}
+      </div>
+
+      <textarea ref={taRef} value={template} onChange={(e) => setTemplate(e.target.value)}
+        rows={6} maxLength={1200}
+        style={{
+          width: "100%", boxSizing: "border-box", fontFamily: "'Open Sans', sans-serif",
+          fontSize: 14, lineHeight: 1.5, padding: "12px 14px", borderRadius: 10,
+          border: `1px solid ${palette.border}`, resize: "vertical", color: palette.dark,
+        }} />
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+        <button onClick={save} disabled={!dirty || saving}
+          style={{
+            fontSize: 14, fontWeight: 700, fontFamily: "'Open Sans', sans-serif",
+            padding: "9px 20px", borderRadius: 10, border: "none", color: "#fff",
+            background: (!dirty || saving) ? palette.border : palette.green,
+            cursor: (!dirty || saving) ? "default" : "pointer",
+          }}>{saving ? "Saving…" : "Save"}</button>
+        {saved && <span style={{ color: palette.green, fontSize: 13, fontWeight: 600 }}>✓ Saved</span>}
+        <button onClick={() => setTemplate(def)}
+          style={{
+            fontSize: 13, fontWeight: 600, fontFamily: "'Open Sans', sans-serif",
+            padding: "9px 14px", borderRadius: 10, border: `1px solid ${palette.border}`,
+            background: "transparent", color: palette.muted, cursor: "pointer",
+          }}>Reset to default</button>
+        <span style={{ marginLeft: "auto", fontSize: 12, color: chars > 320 ? "#c0392b" : palette.muted }}>
+          {chars} characters{chars > 160 ? ` · ${Math.ceil(chars / 153)} texts` : ""}
+        </span>
+      </div>
+
+      <div style={{ marginTop: 18 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: palette.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+          Preview
+        </div>
+        <div style={{
+          background: "#e9f3ff", borderRadius: "14px 14px 14px 4px", padding: "12px 16px",
+          fontSize: 14, lineHeight: 1.5, color: palette.dark, whiteSpace: "pre-wrap",
+          fontFamily: "'Open Sans', sans-serif", maxWidth: 420, border: "1px solid #d2e5fb",
+        }}>{preview || "…"}</div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Automation Panel ────────────────────────────────────────────
 function AutomationPanel({ reservations }) {
   const [rules, setRules] = useState([
@@ -1059,6 +1201,7 @@ function AutomationPanel({ reservations }) {
 
   return (
     <div>
+      <MessageTemplateEditor />
       <div style={{
         fontSize: 20, fontWeight: 600, color: palette.dark,
         fontFamily: "'Montserrat', sans-serif", marginBottom: 4,

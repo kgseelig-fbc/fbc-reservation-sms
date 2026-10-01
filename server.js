@@ -147,8 +147,13 @@ async function loadFranchise(id) {
   if (franchiseCache.has(id)) return franchiseCache.get(id);
   const { rows } = await db.query(`SELECT * FROM franchises WHERE id = $1`, [id]);
   if (rows.length === 0) return null;
-  franchiseCache.set(id, rows[0]);
-  return rows[0];
+  const franchise = rows[0];
+  const { rows: docks } = await db.query(
+    `SELECT id, name FROM docks WHERE franchise_id = $1 ORDER BY sort_order`, [id]
+  );
+  franchise.docks = docks;
+  franchiseCache.set(id, franchise);
+  return franchise;
 }
 function invalidateFranchise(id) {
   franchiseCache.delete(id);
@@ -1355,7 +1360,24 @@ app.post("/api/reservations/:id/reject-time-change", requireAuth, requireFranchi
 });
 
 // --- SMS building ---
-function buildSmsBody(reservation) {
+// The default confirmation text, also shown as the starting point in the
+// template editor. Keep {placeholders} in sync with TEMPLATE_PLACEHOLDERS.
+const DEFAULT_MESSAGE_TEMPLATE =
+  "Hi {first_name}! This is a reminder about your upcoming {boat} on {date} {time_phrase}.\n\n" +
+  "Can you make it? Reply YES to confirm and NO to cancel, or send a new time (e.g. 7:30 AM) if you need to change your arrival.";
+
+const TEMPLATE_PLACEHOLDERS = [
+  { token: "{first_name}", label: "Member first name" },
+  { token: "{name}", label: "Member full name" },
+  { token: "{boat}", label: "Boat / reservation type" },
+  { token: "{date}", label: "Reservation date" },
+  { token: "{time}", label: "Start time" },
+  { token: "{return_time}", label: "Return time" },
+  { token: "{time_phrase}", label: "\"at 8:00 AM\" or \"from 8 to 1\"" },
+  { token: "{dock}", label: "Dock name" },
+];
+
+function templateValues(reservation, franchise) {
   const dateObj = new Date(reservation.reservation_date || reservation.date);
   const dateStr = dateObj.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
   const timeStr = dateObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
@@ -1363,15 +1385,30 @@ function buildSmsBody(reservation) {
   const returnObj = returnRaw ? new Date(returnRaw) : null;
   const returnStr = returnObj && !isNaN(returnObj.getTime())
     ? returnObj.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
-    : null;
+    : "";
   const timePhrase = returnStr ? `from ${timeStr} to ${returnStr}` : `at ${timeStr}`;
-  const name = reservation.name || "there";
-  return (
-    `Hi ${name.split(" ")[0]}! ` +
-    `This is a reminder about your upcoming ${reservation.service || "reservation"} ` +
-    `on ${dateStr} ${timePhrase}.\n\n` +
-    `Can you make it? Reply YES to confirm and NO to cancel, or send a new time (e.g. 7:30 AM) if you need to change your arrival.`
-  );
+  const fullName = reservation.name || "there";
+  const dockName = (franchise && franchise.docks && (franchise.docks.find((d) => d.id === reservation.dock_id) || {}).name)
+    || reservation.dock_id || "";
+  return {
+    "{first_name}": fullName.split(" ")[0],
+    "{name}": fullName,
+    "{boat}": reservation.service || "reservation",
+    "{date}": dateStr,
+    "{time}": timeStr,
+    "{return_time}": returnStr,
+    "{time_phrase}": timePhrase,
+    "{dock}": dockName,
+  };
+}
+
+function renderTemplate(template, values) {
+  return template.replace(/\{[a-z_]+\}/g, (tok) => (tok in values ? values[tok] : tok));
+}
+
+function buildSmsBody(reservation, franchise) {
+  const template = (franchise && franchise.message_template) || DEFAULT_MESSAGE_TEMPLATE;
+  return renderTemplate(template, templateValues(reservation, franchise));
 }
 
 async function sendAndLogSms(franchise, reservationRow, customBody, sentByUserId) {
@@ -1381,7 +1418,7 @@ async function sendAndLogSms(franchise, reservationRow, customBody, sentByUserId
   const toPhone = normalizePhone(reservationRow.phone);
   if (!toPhone || toPhone.length < 10) throw new Error("Invalid phone number format");
 
-  const body = customBody || buildSmsBody(reservationRow);
+  const body = customBody || buildSmsBody(reservationRow, franchise);
   const statusCallback = franchise.base_url
     ? `${franchise.base_url.replace(/\/+$/, "")}/api/sms/status`
     : undefined;
@@ -2135,6 +2172,41 @@ app.post("/api/push/unsubscribe", requireAuth, async (req, res) => {
 // --- Health ---
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
+});
+
+// --- Confirmation message template (admins edit, everyone's sends use it) ---
+app.get("/api/message-template", requireAuth, requireFranchiseContext, (req, res) => {
+  res.json({
+    template: req.franchise.message_template || DEFAULT_MESSAGE_TEMPLATE,
+    isCustom: !!req.franchise.message_template,
+    default: DEFAULT_MESSAGE_TEMPLATE,
+    placeholders: TEMPLATE_PLACEHOLDERS,
+  });
+});
+
+// Live preview — renders the supplied (unsaved) template against a sample
+// reservation so the editor can show what a member would receive.
+app.post("/api/message-template/preview", requireAuth, requireFranchiseContext, (req, res) => {
+  const template = String(req.body.template || DEFAULT_MESSAGE_TEMPLATE).slice(0, 1200);
+  const sample = {
+    name: "Jordan Rivera", service: "SeaRay 230", dock_id: (req.franchise.docks[0] || {}).id,
+    reservation_date: new Date(Date.now() + 2 * 86400000).setHours(8, 0, 0, 0),
+    return_time: new Date(Date.now() + 2 * 86400000).setHours(13, 0, 0, 0),
+  };
+  res.json({ preview: renderTemplate(template, templateValues(sample, req.franchise)) });
+});
+
+app.post("/api/message-template", requireAuth, requireFranchiseContext, async (req, res) => {
+  if (req.session.role !== "super_admin" && req.session.role !== "franchise_admin") {
+    return res.status(403).json({ error: "Only admins can edit the message template" });
+  }
+  let template = req.body.template;
+  // Empty / reset → fall back to the built-in default (store NULL).
+  if (template != null) template = String(template).slice(0, 1200).trim();
+  const toStore = template ? template : null;
+  await db.query(`UPDATE franchises SET message_template = $1 WHERE id = $2`, [toStore, req.franchiseId]);
+  invalidateFranchise(req.franchiseId);
+  res.json({ success: true, template: toStore || DEFAULT_MESSAGE_TEMPLATE, isCustom: !!toStore });
 });
 
 // --- Voice: forward incoming calls to the club's main line ---
