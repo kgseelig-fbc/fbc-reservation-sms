@@ -297,10 +297,22 @@ app.use(async (req, res, next) => {
       );
       user = inserted.rows[0];
     } else {
-      await db.query(
-        `UPDATE users SET name = COALESCE(name, $1), last_login = NOW() WHERE id = $2`,
-        [name, user.id]
+      // Keep a manager's dock assignment in sync with their hub location on
+      // every visit — a staff row with NULL dock_id sees (and is push-notified
+      // about) every dock, which is exactly the noise we want to avoid.
+      const updated = await db.query(
+        `UPDATE users
+            SET name = COALESCE(name, $1),
+                last_login = NOW(),
+                dock_id = CASE
+                  WHEN role = 'franchise_staff' AND $2::text IS NOT NULL THEN $2
+                  ELSE dock_id
+                END
+          WHERE id = $3
+        RETURNING *`,
+        [name, dockId, user.id]
       );
+      user = updated.rows[0];
     }
     if (user.status !== "approved") return next();
 
