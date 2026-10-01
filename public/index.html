@@ -21,6 +21,21 @@
   <script type="text/babel">
 const { useState, useEffect, useReducer, useCallback, useRef } = React;
 
+// Reports whether the viewport is phone-sized, updating on resize/rotate.
+// Inline styles can't be overridden by CSS media queries, so components read
+// this to pick mobile-friendly spacing/layout.
+function useIsMobile(breakpoint = 640) {
+  const [isMobile, setIsMobile] = useState(
+    typeof window !== "undefined" && window.innerWidth <= breakpoint
+  );
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth <= breakpoint);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [breakpoint]);
+  return isMobile;
+}
+
 
 const FONT_URL = "https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700;800&family=Open+Sans:wght@400;500;600;700&display=swap";
 
@@ -813,6 +828,7 @@ function Toast({ message, onDismiss }) {
 }
 
 function ReservationRow({ res, isSelected, isChecked, dispatch }) {
+  const isMobile = useIsMobile();
   const dateStr = res.date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
   const timeStr = res.date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
   const endObj = res.endTime ? new Date(res.endTime) : null;
@@ -825,14 +841,14 @@ function ReservationRow({ res, isSelected, isChecked, dispatch }) {
       onClick={() => dispatch({ type: "TOGGLE_DETAIL", payload: res.id })}
       style={{
         background: isChecked ? "#E8EDF4" : isSelected ? "#F5F8FB" : palette.card,
-        borderRadius: 14, padding: "16px 20px",
+        borderRadius: 14, padding: isMobile ? "13px 14px" : "16px 20px",
         marginBottom: 8, cursor: "pointer",
         border: `1px solid ${isChecked ? palette.accent + "50" : isSelected ? palette.accent + "40" : palette.border}`,
         boxShadow: isSelected ? palette.shadowHover : "none",
         transition: "all 0.2s ease",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 10 : 14, flexWrap: "wrap" }}>
         {/* Checkbox */}
         <div
           onClick={(e) => { e.stopPropagation(); dispatch({ type: "TOGGLE_SELECT", payload: res.id }); }}
@@ -3818,6 +3834,7 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
     showToast: null,
   });
 
+  const isMobile = useIsMobile();
   const [apiStatus, setApiStatus] = useState(api.isLive() ? "connecting" : "local"); // local | connecting | connected | error
   const [unreadCount, setUnreadCount] = useState(0);
 
@@ -4069,14 +4086,14 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
       <div style={{
         minHeight: "100vh", background: palette.bg,
         fontFamily: "'Open Sans', sans-serif",
-        padding: "0 24px 40px",
+        padding: isMobile ? "0 12px 32px" : "0 24px 40px",
         maxWidth: 1200, margin: "0 auto",
       }}>
         {/* Header */}
         <div style={{
-          padding: "32px 0 28px", display: "flex", alignItems: "flex-end",
-          justifyContent: "space-between", flexWrap: "wrap", gap: 16,
-          borderBottom: `2px solid ${palette.dark}`, marginBottom: 28,
+          padding: isMobile ? "18px 0 16px" : "32px 0 28px", display: "flex", alignItems: "flex-end",
+          justifyContent: "space-between", flexWrap: "wrap", gap: isMobile ? 10 : 16,
+          borderBottom: `2px solid ${palette.dark}`, marginBottom: isMobile ? 18 : 28,
         }}>
           <div>
             <div style={{
@@ -4121,12 +4138,15 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
               </div>
             </div>
             <h1 style={{
-              fontSize: 28, fontWeight: 700, color: palette.dark,
+              fontSize: isMobile ? 21 : 28, fontWeight: 700, color: palette.dark,
               fontFamily: "'Montserrat', sans-serif", lineHeight: 1.1,
               letterSpacing: -0.5,
             }}>Reservation Confirmations</h1>
           </div>
-          <div style={{ display: "flex", gap: 10 }}>
+          <div style={{
+            display: "flex", gap: isMobile ? 6 : 10,
+            ...(isMobile ? { width: "100%", overflowX: "auto", WebkitOverflowScrolling: "touch", paddingBottom: 4 } : {}),
+          }}>
             <button
               onClick={() => dispatch({ type: "SET_VIEW", payload: "reservations" })}
               style={{
