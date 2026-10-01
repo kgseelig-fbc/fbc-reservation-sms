@@ -254,7 +254,7 @@ const hubOriginSecret = process.env.HUB_ORIGIN_SECRET || null;
 function hubLocationToDockId(location) {
   const l = (location || "").toLowerCase();
   if (!l) return null;
-  if (l.includes("jax")) return "jax-beach";
+  if (l.includes("jax") || l.includes("jacksonville")) return "jax-beach";
   if (l.includes("west") || l === "jcw") return "julington-west";
   if (l.includes("julington") || l === "jc") return "julington-east";
   if (l.includes("camachee")) return "camachee-cove";
