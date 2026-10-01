@@ -278,15 +278,20 @@ app.use(async (req, res, next) => {
 
   const hubRole = String(req.headers["x-hub-role"] || "");
   const name = String(req.headers["x-hub-name"] || "") || null;
-  const dockId = hubRole === "Manager" ? hubLocationToDockId(req.headers["x-hub-location"]) : null;
+  const dockId = (hubRole === "Manager" || hubRole === "Dock Staff")
+    ? hubLocationToDockId(req.headers["x-hub-location"])
+    : null;
 
   try {
     const { rows } = await db.query(`SELECT * FROM users WHERE email = $1 LIMIT 1`, [email]);
     let user = rows[0];
     if (!user) {
-      // The worker only proxies Admin/Manager hub sessions, but enforce it
-      // here too so a worker bug can't mint accounts for other roles.
-      if (hubRole !== "Admin" && hubRole !== "Manager") return next();
+      // The worker only proxies Admin/Manager/dock-phone hub sessions, but
+      // enforce it here too so a worker bug can't mint accounts for other
+      // roles. Dock Staff must be dock-scoped — never create an unscoped
+      // staff account that would see (and be alerted about) every dock.
+      if (hubRole !== "Admin" && hubRole !== "Manager" && hubRole !== "Dock Staff") return next();
+      if (hubRole === "Dock Staff" && !dockId) return next();
       const role = hubRole === "Admin" ? "franchise_admin" : "franchise_staff";
       const inserted = await db.query(
         `INSERT INTO users (email, name, role, franchise_id, dock_id, status, approved_at)
