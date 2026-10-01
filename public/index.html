@@ -751,7 +751,10 @@ const palette = {
   border: "#D1DAE6",
   shadow: "0 1px 3px rgba(11,37,69,0.04), 0 4px 12px rgba(11,37,69,0.06)",
   shadowHover: "0 2px 8px rgba(11,37,69,0.08), 0 8px 24px rgba(11,37,69,0.08)",
+  iosBlue: "#007AFF",   // iMessage sent bubble
+  iosGrey: "#E5E5EA",   // iMessage received bubble
 };
+const IMSG_FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Open Sans', sans-serif";
 
 const statusConfig = {
   confirmed: { color: palette.green, bg: palette.greenLight, label: "Confirmed", icon: "✓" },
@@ -1666,26 +1669,25 @@ function SmsDrawer({ reservation, dispatch }) {
         ) : (
           log.map((msg, i) => (
             <div key={i} style={{
-              display: "flex",
-              justifyContent: msg.from === "system" ? "flex-start" : "flex-end",
+              display: "flex", flexDirection: "column",
+              alignItems: msg.from === "system" ? "flex-end" : "flex-start",
+              margin: "1px 0",
             }}>
               <div style={{
-                maxWidth: "80%", padding: "10px 14px", borderRadius: 16,
-                borderBottomLeftRadius: msg.from === "system" ? 4 : 16,
-                borderBottomRightRadius: msg.from === "member" ? 4 : 16,
-                background: msg.from === "system" ? palette.card : palette.accent,
-                color: msg.from === "system" ? palette.dark : "#fff",
-                fontSize: 13, lineHeight: 1.6, fontFamily: "'Open Sans', sans-serif",
-                boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
-                whiteSpace: "pre-wrap",
+                maxWidth: "78%", padding: "8px 13px", borderRadius: 18,
+                borderBottomRightRadius: msg.from === "system" ? 5 : 18,
+                borderBottomLeftRadius: msg.from === "system" ? 18 : 5,
+                background: msg.from === "system" ? palette.iosBlue : palette.iosGrey,
+                color: msg.from === "system" ? "#fff" : "#000",
+                fontSize: 15, lineHeight: 1.35, fontFamily: IMSG_FONT,
+                whiteSpace: "pre-wrap", wordBreak: "break-word",
               }}>
                 {msg.text}
-                <div style={{
-                  fontSize: 10, marginTop: 4, textAlign: "right",
-                  color: msg.from === "system" ? palette.muted : "rgba(255,255,255,0.7)",
-                }}>
-                  {new Date(msg.time).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
-                </div>
+              </div>
+              <div style={{
+                fontSize: 10, margin: "2px 4px 3px", color: palette.muted, fontFamily: IMSG_FONT,
+              }}>
+                {new Date(msg.time).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
               </div>
             </div>
           ))
@@ -2508,16 +2510,19 @@ function BatchDetailDrawer({ batchId, onClose }) {
                       return (
                         <div key={i} style={{
                           alignSelf: inbound ? "flex-start" : "flex-end",
-                          maxWidth: "85%",
-                          background: inbound ? palette.blueLight : palette.accentLight,
-                          color: palette.dark,
-                          padding: "8px 12px", borderRadius: 10,
-                          fontSize: 13, fontFamily: "'Open Sans', sans-serif",
-                          whiteSpace: "pre-wrap",
+                          maxWidth: "80%",
+                          background: inbound ? palette.iosGrey : palette.iosBlue,
+                          color: inbound ? "#000" : "#fff",
+                          padding: "8px 13px", borderRadius: 18,
+                          borderBottomLeftRadius: inbound ? 5 : 18,
+                          borderBottomRightRadius: inbound ? 18 : 5,
+                          fontSize: 15, lineHeight: 1.35, fontFamily: IMSG_FONT,
+                          whiteSpace: "pre-wrap", wordBreak: "break-word",
                         }}>
                           {m.text}
                           <div style={{
-                            fontSize: 10, color: palette.muted, marginTop: 4,
+                            fontSize: 10, marginTop: 3,
+                            color: inbound ? palette.muted : "rgba(255,255,255,0.7)",
                           }}>{tlabel}</div>
                         </div>
                       );
@@ -3518,27 +3523,26 @@ function ConversationDrawer({ phone, onClose }) {
                 </div>
               )}
               <div style={{
-                display: "flex",
-                justifyContent: msg.from === "system" ? "flex-start" : "flex-end",
+                display: "flex", flexDirection: "column",
+                alignItems: msg.from === "system" ? "flex-end" : "flex-start",
+                margin: "1px 0",
               }}>
                 <div style={{
-                  maxWidth: "80%", padding: "10px 14px", borderRadius: 16,
-                  borderBottomLeftRadius: msg.from === "system" ? 4 : 16,
-                  borderBottomRightRadius: msg.from === "member" ? 4 : 16,
-                  background: msg.from === "system" ? palette.card : palette.accent,
-                  color: msg.from === "system" ? palette.dark : "#fff",
-                  fontSize: 13, lineHeight: 1.6, fontFamily: "'Open Sans', sans-serif",
-                  boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
-                  whiteSpace: "pre-wrap",
+                  maxWidth: "78%", padding: "8px 13px", borderRadius: 18,
+                  borderBottomRightRadius: msg.from === "system" ? 5 : 18,
+                  borderBottomLeftRadius: msg.from === "system" ? 18 : 5,
+                  background: msg.from === "system" ? palette.iosBlue : palette.iosGrey,
+                  color: msg.from === "system" ? "#fff" : "#000",
+                  fontSize: 15, lineHeight: 1.35, fontFamily: IMSG_FONT,
+                  whiteSpace: "pre-wrap", wordBreak: "break-word",
                 }}>
                   {msg.text}
-                  <div style={{
-                    fontSize: 10, marginTop: 4, textAlign: "right",
-                    color: msg.from === "system" ? palette.muted : "rgba(255,255,255,0.7)",
-                  }}>
-                    {t.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
-                    {msg.dockId ? ` · ${dockName(msg.dockId)}` : ""}
-                  </div>
+                </div>
+                <div style={{
+                  fontSize: 10, margin: "2px 4px 3px", color: palette.muted, fontFamily: IMSG_FONT,
+                }}>
+                  {t.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                  {msg.dockId ? ` · ${dockName(msg.dockId)}` : ""}
                 </div>
               </div>
             </React.Fragment>
