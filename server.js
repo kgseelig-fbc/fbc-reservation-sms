@@ -1771,10 +1771,8 @@ const HANDOFF_RESPONSE =
   "If you also want to confirm or change this reservation, reply YES, NO, " +
   "or a new time like \"7:30 AM\".";
 const ROBOTIC_FALLBACK =
-  "Sorry, I didn't quite catch that. You can reply:\n" +
-  "• YES to confirm\n" +
-  "• NO to cancel\n" +
-  "• A new time like \"7:30 AM\" to change your arrival";
+  "Thanks for your message! A team member will follow up with you shortly. " +
+  "If you're confirming your reservation you can also just reply YES, or NO to cancel.";
 
 async function applyCancel(reservation) {
   await db.query(`UPDATE reservations SET status = 'cancelled' WHERE id = $1`, [reservation.id]);
