@@ -2034,19 +2034,21 @@ app.get("/api/conversations", requireAuth, requireFranchiseContext, async (req, 
          mem.email,
          COUNT(*)::int AS message_count,
          MAX(m.created_at) AS last_message_at,
+         MAX(m.created_at) FILTER (WHERE m.direction = 'in') AS last_inbound_at,
          (ARRAY_AGG(m.body ORDER BY m.created_at DESC))[1] AS last_message_body,
          (ARRAY_AGG(m.direction ORDER BY m.created_at DESC))[1] AS last_direction,
-         (ARRAY_AGG(m.dock_id ORDER BY m.created_at DESC))[1] AS last_dock_id
+         (ARRAY_AGG(m.dock_id ORDER BY m.created_at DESC))[1] AS last_dock_id,
+         r_last.status AS res_status
        FROM messages m
        LEFT JOIN members mem ON mem.phone = m.phone AND mem.franchise_id = m.franchise_id
        LEFT JOIN LATERAL (
-         SELECT name, dock_id FROM reservations r
+         SELECT name, dock_id, status FROM reservations r
          WHERE r.phone = m.phone AND r.franchise_id = m.franchise_id
          ORDER BY r.created_at DESC LIMIT 1
        ) r_last ON TRUE
        WHERE m.franchise_id = $1
          AND ($2::text IS NULL OR r_last.dock_id = $2)
-       GROUP BY m.phone, mem.name, mem.email, r_last.name
+       GROUP BY m.phone, mem.name, mem.email, r_last.name, r_last.status
        ORDER BY MAX(m.created_at) DESC`,
       [req.franchiseId, scope]
     );

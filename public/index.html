@@ -3119,13 +3119,16 @@ function ConversationsPanel({ onOpen, onToast }) {
 
   const dockName = (id) => (DOCKS.find((d) => d.id === id) || {}).name || id || "—";
 
-  // A conversation is "unread" when the most recent message is inbound AND
-  // its timestamp is newer than the localStorage read-mark for that phone.
+  // "Unread" = the member wrote in but we can't tell what they want. A clear
+  // YES/NO flips the reservation to confirmed/cancelled and is NOT unread;
+  // an ambiguous reply leaves the reservation unresolved (not confirmed or
+  // cancelled) with an inbound newer than the staff's read-mark.
   const isUnread = (c) => {
-    if (c.last_direction !== "in") return false;
+    if (!c.last_inbound_at) return false;
+    if (c.res_status === "confirmed" || c.res_status === "cancelled") return false;
     const readStr = localStorage.getItem(`conv_read_${c.phone}`);
     const readAt = readStr ? new Date(readStr).getTime() : 0;
-    return new Date(c.last_message_at).getTime() > readAt;
+    return new Date(c.last_inbound_at).getTime() > readAt;
   };
 
   const filtered = conversations
@@ -3851,8 +3854,10 @@ function ReservationDashboard({ onLogout, me, onFranchiseChanged }) {
         if (!active) return;
         const convos = data.conversations || [];
         const count = convos.filter((c) => {
-          if (c.last_direction !== "in") return false;
-          const lastAt = new Date(c.last_message_at).getTime();
+          // Mirror ConversationsPanel.isUnread: a reply we couldn't resolve.
+          if (!c.last_inbound_at) return false;
+          if (c.res_status === "confirmed" || c.res_status === "cancelled") return false;
+          const lastAt = new Date(c.last_inbound_at).getTime();
           const readStr = localStorage.getItem(`conv_read_${c.phone}`);
           const readAt = readStr ? new Date(readStr).getTime() : 0;
           return lastAt > readAt;
