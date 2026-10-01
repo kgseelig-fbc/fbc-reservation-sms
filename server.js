@@ -2247,6 +2247,68 @@ app.get("/api/sf-sync/pending", requireOriginSecret, async (req, res) => {
   }
 });
 
+// --- On-demand date pull (admin requests a date; Mac worker fulfils it) ---
+app.post("/api/reservations/pull", requireAuth, requireFranchiseContext, async (req, res) => {
+  if (req.session.role !== "super_admin" && req.session.role !== "franchise_admin") {
+    return res.status(403).json({ error: "Only admins can pull a different date" });
+  }
+  const date = String(req.body.date || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "Date must be YYYY-MM-DD" });
+  try {
+    // Collapse duplicate pending requests for the same date.
+    const { rows } = await db.query(
+      `INSERT INTO pull_requests (franchise_id, target_date, requested_by)
+       SELECT $1, $2, $3
+       WHERE NOT EXISTS (
+         SELECT 1 FROM pull_requests
+          WHERE franchise_id = $1 AND target_date = $2 AND status = 'pending'
+       )
+       RETURNING id`,
+      [req.franchiseId, date, req.session.userId]
+    );
+    res.json({ success: true, queued: rows.length > 0, id: rows[0] ? rows[0].id : null, date });
+  } catch (err) {
+    console.error("pull request error:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Latest pull-request status for this franchise (the app polls this).
+app.get("/api/reservations/pull/status", requireAuth, requireFranchiseContext, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT id, to_char(target_date, 'YYYY-MM-DD') AS target_date, status,
+            result_count, error_detail, requested_at, completed_at
+       FROM pull_requests WHERE franchise_id = $1
+      ORDER BY id DESC LIMIT 1`, [req.franchiseId]
+  );
+  res.json({ latest: rows[0] || null });
+});
+
+// Mac worker: pending pulls + mark complete (machine auth).
+app.get("/api/pull-requests/pending", requireOriginSecret, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT id, franchise_id, to_char(target_date, 'YYYY-MM-DD') AS target_date
+       FROM pull_requests WHERE status = 'pending' ORDER BY id ASC LIMIT 20`
+  );
+  res.json({ pending: rows });
+});
+app.post("/api/pull-requests/complete", requireOriginSecret, async (req, res) => {
+  const { id, status, count, error } = req.body || {};
+  if (!id) return res.status(400).json({ error: "Missing id" });
+  try {
+    await db.query(
+      `UPDATE pull_requests
+          SET status = $1, result_count = $2, error_detail = $3, completed_at = NOW()
+        WHERE id = $4`,
+      [status === "error" ? "error" : "done", Number.isInteger(count) ? count : null, error || null, id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("pull complete error:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 // Clear the flag for rows the Mac successfully pushed to SF.
 app.post("/api/sf-sync/ack", requireOriginSecret, async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? req.body.ids.filter((x) => typeof x === "string") : [];
