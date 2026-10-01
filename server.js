@@ -2134,6 +2134,30 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// --- Voice: forward incoming calls to the club's main line ---
+// The SMS number looks like a normal number, so members will call it. Rather
+// than let the call die, forward it to the franchise's voice_forward_number
+// (falls back to the VOICE_FORWARD env var). Twilio hits this for both GET
+// and POST depending on how the number's voice webhook is configured.
+async function handleVoice(req, res) {
+  const to = req.body.To || req.query.To;
+  let forwardTo = process.env.VOICE_FORWARD || "";
+  try {
+    const franchise = to ? await findFranchiseByInboundTo(to) : null;
+    if (franchise && franchise.voice_forward_number) forwardTo = franchise.voice_forward_number;
+  } catch (err) {
+    console.error("Voice lookup error:", err.message);
+  }
+  res.set("Content-Type", "text/xml");
+  if (forwardTo) {
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Dial>${forwardTo}</Dial></Response>`);
+  } else {
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>This number is for text messages only. Please call your Freedom Boat Club location directly. Goodbye.</Say><Hangup/></Response>`);
+  }
+}
+app.post("/api/voice", express.urlencoded({ extended: false }), handleVoice);
+app.get("/api/voice", handleVoice);
+
 // --- Root + static ---
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 app.use(express.static(path.join(__dirname, "public")));
