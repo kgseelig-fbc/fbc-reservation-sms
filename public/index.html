@@ -3094,6 +3094,44 @@ function NewMessageModal({ onClose, onSent }) {
   );
 }
 
+// Read-only inline thread shown under a conversation row when expanded, so
+// staff can read every conversation at once without opening each drawer.
+function InlineThread({ phone }) {
+  const [msgs, setMsgs] = useState(null);
+  useEffect(() => {
+    let active = true;
+    api.getConversation(phone)
+      .then((d) => { if (active) setMsgs(d.messages || []); })
+      .catch(() => { if (active) setMsgs([]); });
+    return () => { active = false; };
+  }, [phone]);
+  if (!msgs) return <div style={{ padding: "10px 16px", fontSize: 12, color: palette.muted }}>Loading…</div>;
+  if (msgs.length === 0) return <div style={{ padding: "10px 16px", fontSize: 12, color: palette.muted }}>No messages yet.</div>;
+  return (
+    <div style={{
+      padding: "10px 16px 14px", background: "#fff",
+      borderTop: `1px solid ${palette.border}`,
+      display: "flex", flexDirection: "column", gap: 1,
+    }}>
+      {msgs.map((m, i) => (
+        <div key={i} style={{
+          display: "flex", justifyContent: m.from === "system" ? "flex-end" : "flex-start", margin: "1px 0",
+        }}>
+          <div style={{
+            maxWidth: "80%", padding: "7px 12px", borderRadius: 16,
+            borderBottomRightRadius: m.from === "system" ? 5 : 16,
+            borderBottomLeftRadius: m.from === "system" ? 16 : 5,
+            background: m.from === "system" ? palette.iosBlue : palette.iosGrey,
+            color: m.from === "system" ? "#fff" : "#000",
+            fontSize: 14, lineHeight: 1.3, fontFamily: IMSG_FONT,
+            whiteSpace: "pre-wrap", wordBreak: "break-word",
+          }}>{m.text}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ConversationsPanel({ onOpen, onToast }) {
   const [conversations, setConversations] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -3101,6 +3139,13 @@ function ConversationsPanel({ onOpen, onToast }) {
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState("unread"); // unread | newest | oldest | name
   const [composing, setComposing] = useState(false);
+  const [expandAll, setExpandAll] = useState(false);
+  const [expanded, setExpanded] = useState(() => new Set());
+  const toggleExpand = (phone) => setExpanded((prev) => {
+    const next = new Set(prev);
+    next.has(phone) ? next.delete(phone) : next.add(phone);
+    return next;
+  });
 
   useEffect(() => {
     let active = true;
@@ -3197,6 +3242,18 @@ function ConversationsPanel({ onOpen, onToast }) {
           <option value="name">Name A–Z</option>
         </select>
         <button
+          onClick={() => setExpandAll((v) => !v)}
+          title={expandAll ? "Collapse all threads" : "Show every conversation's messages at once"}
+          style={{
+            padding: "10px 14px", borderRadius: 10,
+            border: `1.5px solid ${expandAll ? palette.accent : palette.border}`,
+            background: expandAll ? palette.accentLight : palette.card,
+            color: expandAll ? palette.accent : palette.muted,
+            fontSize: 13, fontWeight: 600, cursor: "pointer",
+            fontFamily: "'Open Sans', sans-serif",
+          }}
+        >{expandAll ? "Collapse all" : "Expand all"}</button>
+        <button
           onClick={() => setComposing(true)}
           style={{
             padding: "10px 16px", borderRadius: 10, border: "none",
@@ -3242,14 +3299,14 @@ function ConversationsPanel({ onOpen, onToast }) {
             const preview = (c.last_message_body || "").replace(/\s+/g, " ").slice(0, 120);
             const inbound = c.last_direction === "in";
             const unread = isUnread(c);
+            const isOpen = expandAll || expanded.has(c.phone);
             return (
+              <div key={c.phone} style={{ borderBottom: idx === filtered.length - 1 ? "none" : `1px solid ${palette.border}` }}>
               <div
-                key={c.phone}
                 onClick={() => onOpen(c.phone)}
                 style={{
                   display: "flex", alignItems: "center", gap: 14,
                   padding: "14px 18px", cursor: "pointer",
-                  borderBottom: idx === filtered.length - 1 ? "none" : `1px solid ${palette.border}`,
                   background: unread ? "#FFF7E6" : "transparent",
                   transition: "background 0.12s",
                   position: "relative",
@@ -3315,6 +3372,17 @@ function ConversationsPanel({ onOpen, onToast }) {
                     {c.phone} · {c.message_count} message{c.message_count === 1 ? "" : "s"} · {dockName(c.last_dock_id)}
                   </div>
                 </div>
+                <button
+                  onClick={(e) => { e.stopPropagation(); toggleExpand(c.phone); }}
+                  title={isOpen ? "Hide messages" : "Show messages"}
+                  style={{
+                    flexShrink: 0, border: "none", background: "transparent", cursor: "pointer",
+                    color: palette.muted, fontSize: 16, padding: "4px 8px", lineHeight: 1,
+                    transform: isOpen ? "rotate(180deg)" : "none", transition: "transform 0.15s",
+                  }}
+                >▾</button>
+              </div>
+              {isOpen && <InlineThread phone={c.phone} />}
               </div>
             );
           })}
